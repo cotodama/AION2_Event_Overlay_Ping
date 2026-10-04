@@ -2,7 +2,7 @@
 
 # AION2 Event Overlay + Ping
 
-hosigumolaylaさんの [AION2 Event Overlay](https://github.com/hosigumolayla/AION2-Event-Overlay) のイベント表示・時計・通知・タイマーを基に、cotodama向けのTCP Pingとサーバー情報を追加したWindows版です。元のMITライセンスを同梱しています。
+hosigumolaylaさんの [AION2 Event Overlay](https://github.com/hosigumolayla/AION2-Event-Overlay) を基に、TCP Pingとサーバー情報を追加したWindows版です。元のMITライセンスを同梱しています。
 
 ## 起動
 
