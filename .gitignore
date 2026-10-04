@@ -1,0 +1,11 @@
+data/
+*.exe
+*.zip
+__pycache__/
+*.pyc
+.build-env/
+.pyinstaller-cache/
+build/
+dist/
+*.spec
+startup_error.txt
