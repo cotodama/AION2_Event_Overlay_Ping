@@ -155,6 +155,8 @@ class PingFeatureMixin:
         self.root.after(200,self.poll_tray)
 
     def sync_drag_surface(self):
+        # Tk popdown menus own a grab. Native restacking cancels that menu.
+        if self.root.tk.call('grab','current'): return
         if getattr(self,'_syncing_drag',False): return
         self._syncing_drag=True
         try:

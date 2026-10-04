@@ -92,6 +92,34 @@ def run_check(result_path):
             assert 'arrow' not in str(style.layout('Overlay.Vertical.TScrollbar')).lower()
             report['checks'].append('surface drag + controls exclusion + minimize/restore + maximize/restore + arrowless dark scrollbars')
             app.show_tab('ping'); root.update()
+            app.sync_drag_surface(); root.update()
+            lower_calls=[]; original_lower=app.drag_surface.lower
+            app.drag_surface.lower=lambda *args:lower_calls.append(args)
+            app.header_canvas.grab_set()
+            for _ in range(5): app.sync_drag_surface()
+            app.header_canvas.grab_release()
+            app.drag_surface.lower=original_lower
+            assert not lower_calls
+            def combos(widget):
+                found=[widget] if isinstance(widget,tk.ttk.Combobox) else []
+                for child in widget.winfo_children(): found.extend(combos(child))
+                return found
+            for page in ('ping','status'):
+                app.show_tab(page); root.update()
+                combo=next(w for w in combos(root) if w.winfo_ismapped())
+                root.tk.call('ttk::combobox::Post',str(combo))
+                pop=root.tk.call('ttk::combobox::PopdownWindow',str(combo))
+                ready=tk.BooleanVar(root,value=False)
+                root.after(650,lambda:ready.set(True)); root.wait_variable(ready)
+                assert root.tk.call('winfo','ismapped',pop)
+                root.tk.call('ttk::combobox::Unpost',str(combo))
+                combo.current(1); combo.event_generate('<<ComboboxSelected>>'); root.update()
+                assert combo.current()==1
+                combo.current(0); combo.event_generate('<<ComboboxSelected>>'); root.update()
+            app.ping_cfg['region']='Japan'
+            app.show_tab('ping'); app.render_ping_list()
+            app.show_tab('ping'); root.update()
+            report['checks'].append('Ping/status popdowns stay open across polling and accept selections')
             assert not app.event_section.winfo_ismapped() and app.ping_widgets
             assert app.list_area.body.winfo_children()[0].cget('text')=='COMMON / LOGIN'
             assert next(iter(app.ping_widgets))=='Japan:Common:LoginServer'
@@ -222,4 +250,5 @@ def run_check(result_path):
             try: root.destroy()
             except Exception: pass
     result_path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+
 
