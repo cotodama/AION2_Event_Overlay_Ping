@@ -1,0 +1,87 @@
+{
+  "language": "ja",
+  "display_timezone": "JST",
+  "background_opacity": 0.88,
+  "alert_volume": 45,
+  "alert_sound_file": "",
+  "timer_alert_volume": 45,
+  "timer_alert_sound_file": "",
+  "events": [
+    {
+      "name_ja": "時空の亀裂",
+      "name_en": "Spacetime Rift",
+      "type": "interval",
+      "start": "02:00",
+      "interval_minutes": 180,
+      "duration_minutes": 60,
+      "entry_minutes": 10,
+      "notify_before_minutes": 5,
+      "alert_timing": "start_only",
+      "enabled": true
+    },
+    {
+      "name_ja": "シューゴフェスタ",
+      "name_en": "Shugo Festa",
+      "type": "interval",
+      "start": "00:00",
+      "interval_minutes": 60,
+      "duration_minutes": 10,
+      "entry_minutes": 5,
+      "notify_before_minutes": 5,
+      "alert_timing": "start_only",
+      "enabled": true
+    },
+    {
+      "name_ja": "戦場",
+      "name_en": "Battlefield",
+      "type": "windows",
+      "windows": [
+        [
+          "11:00",
+          "14:00"
+        ],
+        [
+          "19:00",
+          "21:00"
+        ]
+      ],
+      "enabled": true,
+      "notify_before_minutes": 5,
+      "alert_timing": "start_only"
+    },
+    {
+      "name_ja": "アーティファクト占領戦",
+      "name_en": "Artifact Siege",
+      "type": "weekly",
+      "weekdays": [
+        2,
+        5
+      ],
+      "times": [
+        "21:00"
+      ],
+      "duration_minutes": 30,
+      "entry_minutes": 0,
+      "notify_before_minutes": 30,
+      "alert_timing": "start_only",
+      "enabled": true
+    }
+  ],
+  "timers": [
+    {
+      "name": "タイマー1",
+      "duration": 300,
+      "visible": false
+    },
+    {
+      "name": "タイマー2",
+      "duration": 600,
+      "visible": false
+    },
+    {
+      "name": "タイマー3",
+      "duration": 900,
+      "visible": false
+    }
+  ]
+}
