@@ -71,12 +71,12 @@ class ServicesTest(unittest.TestCase):
         app._background_disabled=False; app.scan_busy=False; app.next_scan=0
         app.fetch_busy=False; app.next_fetch=0; app.active_tab='events'; app.ping_generation=0
         app.profiles={}; app.ping_cfg={'selected':[]}
-        with patch('ping_feature.threading.Thread',FakeThread),patch('ping_feature.time.monotonic') as clock:
+        with patch('ping_feature.threading.Thread',FakeThread),patch('ping_feature.time.time',return_value=0),patch('ping_feature.time.monotonic') as clock:
             clock.return_value=100.; app.poll_network(); self.assertEqual(len(FakeThread.targets),1)
             app.fetch_busy=False
             for tab in ('events','status','balance','status'):
-                app.active_tab=tab; clock.return_value=159.; app.poll_network()
+                app.active_tab=tab; clock.return_value=399.; app.poll_network()
             self.assertEqual(len(FakeThread.targets),1)
-            clock.return_value=160.; app.poll_network(); self.assertEqual(len(FakeThread.targets),2)
+            clock.return_value=1000.; app.poll_network(); self.assertEqual(len(FakeThread.targets),2)
 
 if __name__=='__main__': unittest.main()
