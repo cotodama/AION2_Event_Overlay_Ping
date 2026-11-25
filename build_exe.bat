@@ -5,11 +5,13 @@ py -3 -m venv .build-env
 if errorlevel 1 goto failed
 .build-env\Scripts\python.exe -m pip install -r requirements-build.txt
 if errorlevel 1 goto failed
-set "PYINSTALLER_CONFIG_DIR=%CD%\.pyinstaller-cache"
-.build-env\Scripts\python.exe -m PyInstaller --noconfirm --clean --onefile --windowed --noupx --name AION2_Event_Overlay_Ping --paths AION2-Event-Overlay --icon AION2-Event-Overlay\AION2_Event_Overlay.ico --add-data "AION2-Event-Overlay\AION2_Event_Overlay.ico;." --add-data "AION2-Event-Overlay\aion2_overlay.json;." AION2_Event_Overlay_Ping.pyw
+.build-env\Scripts\python.exe -m unittest discover -s tests
 if errorlevel 1 goto failed
-copy /y dist\AION2_Event_Overlay_Ping.exe AION2_Event_Overlay_Ping.exe
-echo Build completed.
+.build-env\Scripts\python.exe tools\build_release.py
+if errorlevel 1 goto failed
+.build-env\Scripts\python.exe tools\package_release.py
+if errorlevel 1 goto failed
+echo Build completed. See the release folder.
 pause
 exit /b 0
 :failed

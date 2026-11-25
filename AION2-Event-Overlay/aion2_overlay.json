@@ -17,7 +17,14 @@
       "entry_minutes": 10,
       "notify_before_minutes": 5,
       "alert_timing": "start_only",
-      "enabled": true
+      "enabled": true,
+      "id": "rift",
+      "alert_enabled": true,
+      "sound_enabled": true,
+      "sound_file": "",
+      "sound_volume": null,
+      "schedule_confirmed": false,
+      "schedule_note": "未確認（旧初期値）"
     },
     {
       "name_ja": "シューゴフェスタ",
@@ -26,10 +33,17 @@
       "start": "00:00",
       "interval_minutes": 60,
       "duration_minutes": 10,
-      "entry_minutes": 5,
-      "notify_before_minutes": 5,
+      "entry_minutes": 3,
+      "notify_before_minutes": 0,
       "alert_timing": "start_only",
-      "enabled": true
+      "enabled": true,
+      "id": "shugo",
+      "alert_enabled": true,
+      "sound_enabled": true,
+      "sound_file": "",
+      "sound_volume": null,
+      "schedule_confirmed": true,
+      "schedule_note": "ユーザー指定：毎時00分 / 入場3分"
     },
     {
       "name_ja": "戦場",
@@ -45,9 +59,16 @@
           "21:00"
         ]
       ],
-      "enabled": true,
       "notify_before_minutes": 5,
-      "alert_timing": "start_only"
+      "alert_timing": "start_only",
+      "enabled": true,
+      "id": "battlefield",
+      "alert_enabled": true,
+      "sound_enabled": true,
+      "sound_file": "",
+      "sound_volume": null,
+      "schedule_confirmed": false,
+      "schedule_note": "未確認（旧初期値）"
     },
     {
       "name_ja": "アーティファクト占領戦",
@@ -63,8 +84,39 @@
       "duration_minutes": 30,
       "entry_minutes": 0,
       "notify_before_minutes": 30,
+      "alert_timing": "both",
+      "enabled": true,
+      "id": "artifact",
+      "alert_enabled": true,
+      "sound_enabled": true,
+      "sound_file": "",
+      "sound_volume": null,
+      "schedule_confirmed": false,
+      "schedule_note": "未確認（旧初期値）",
+      "notification_leads": [
+        40,
+        30,
+        0
+      ]
+    },
+    {
+      "id": "dimensional-invasion",
+      "name_ja": "次元侵攻",
+      "name_en": "Dimensional Invasion",
+      "type": "interval",
+      "start": "00:30",
+      "interval_minutes": 60,
+      "entry_minutes": 0,
+      "enabled": true,
+      "alert_enabled": true,
+      "sound_enabled": true,
+      "sound_file": "",
+      "sound_volume": null,
+      "notify_before_minutes": 0,
       "alert_timing": "start_only",
-      "enabled": true
+      "schedule_confirmed": true,
+      "schedule_note": "ユーザー指定：毎時30分",
+      "description": "陣営のフィールド／ゲーム内の次元侵攻アイコンをタップして入場"
     }
   ],
   "timers": [
@@ -83,5 +135,7 @@
       "duration": 900,
       "visible": false
     }
-  ]
+  ],
+  "show_event_emoji": true,
+  "event_schema": 2
 }

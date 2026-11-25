@@ -12,10 +12,13 @@ from tkinter import ttk, messagebox
 import webbrowser
 from ping_catalog import build_default_profiles, SERVER_NAME_PAIRS
 from ping_service import scan, latency_color
+from ping_layer import PingLayerMixin
 from server_data import (REGIONS, SOURCE_URL, PAIRING_SOURCE, fetch_snapshot,
-                         filtered_servers, status_label, balance_groups, balance_fraction)
+                         filtered_servers, status_label, balance_groups, balance_fraction, FETCH_INTERVAL_SECONDS)
 
 BG='#202020'; TEXT='#ffffff'; DIM='#c5ccd6'; BLUE='#79c9ff'; PURPLE='#c197ff'
+
+def metric(value): return '未確認' if value is None else f'{value:,}'
 
 class ScrollArea:
     def __init__(self,parent,height=350,bg=BG,horizontal=False):
@@ -73,7 +76,14 @@ class ScrollArea:
         for w in self.body.winfo_children(): w.destroy()
         self.canvas.yview_moveto(0)
 
-class PingFeatureMixin:
+class PingFeatureMixin(PingLayerMixin):
+    def reveal_dialog(self,win):
+        if not win.winfo_exists(): return
+        from window_placement import clamp_window
+        clamp_window(win)
+        win.deiconify(); win.lift(); win.focus_force()
+        self.window_group.sync()
+
     def setup_dialog_position(self,win,title):
         win._position_key={'設定':'event_settings','Settings':'event_settings',
                            'Ping表示・オーバーレイ設定':'ping_settings',
@@ -86,7 +96,7 @@ class PingFeatureMixin:
         win.geometry(f'+{x}+{y}')
         def shown(event):
             if event.widget is not win: return
-            win.lift()
+            self.reveal_dialog(win)
             def ready():
                 if win.winfo_exists():
                     win._auto_dialog_xy={'x':win.winfo_x(),'y':win.winfo_y()}
@@ -132,29 +142,40 @@ class PingFeatureMixin:
         self.drag_surface.bind('<ButtonPress-1>',self._move_handle_start)
         self.drag_surface.bind('<B1-Motion>',self._move_handle_drag)
         self.drag_surface.bind('<ButtonRelease-1>',self._move_handle_end)
-        self.root.bind('<Configure>',lambda e:self.root.after_idle(self.sync_drag_surface) if e.widget is self.root else None,add='+')
+        self.root.bind('<Configure>',self.queue_surface_sync,add='+')
         self.root.bind('<Map>',lambda e:self.root.after_idle(self.sync_drag_surface) if e.widget is self.root else None,add='+')
         self.root.bind('<Unmap>',lambda e:self.drag_surface.withdraw() if e.widget is self.root else None,add='+')
         self.root.after_idle(self.sync_drag_surface)
         self.root.bind('<Map>',self.restore_minimized_frame,add='+')
+        self.root.bind('<Map>',lambda e:self.root.after_idle(self.refresh_taskbar_entry) if e.widget is self.root else None,add='+')
         self.tray_icon=None
         self.root.after(200,self.poll_tray)
-        if not self._background_disabled: self.root.after(500,self.refresh_taskbar_entry)
+
+    def queue_surface_sync(self,event):
+        if event.widget is not self.root: return
+        rect=(event.x,event.y,event.width,event.height)
+        if rect==getattr(self,'_surface_event_rect',None): return
+        self._surface_event_rect=rect
+        self.root.after_idle(self.sync_drag_surface)
 
     def refresh_taskbar_entry(self):
-        # Let the Shell see the APPWINDOW style on a fresh show.
+        # Tk may replace native styles on Map; restore them without hiding the HUD.
         if self.root.state()=='iconic' or self.stop_workers.is_set(): return
-        self.root.withdraw(); self.root.after(30,self.root.deiconify)
+        from window_placement import restore_taskbar
+        restore_taskbar(self.root)
+        self.refresh_hud_control_rects()
 
     def poll_tray(self):
         if self.stop_workers.is_set(): return
         self.sync_drag_surface()
+        if hasattr(self,"window_group"): self.window_group.sync()
         if self.tray_icon and self.tray_icon.restore_requested:
             self.tray_icon.restore_requested=False; self.root.deiconify(); self.root.lift()
         if self.tray_icon and self.root.state()!='iconic': self.tray_icon.hide()
         self.root.after(200,self.poll_tray)
 
     def sync_drag_surface(self):
+        if getattr(self,'_startup_pending',False): return
         # Tk popdown menus own a grab. Native restacking cancels that menu.
         if self.root.tk.call('grab','current'): return
         if getattr(self,'_syncing_drag',False): return
@@ -163,7 +184,6 @@ class PingFeatureMixin:
             if not self.drag_surface.winfo_exists(): return
             if not self.root.winfo_ismapped() or self.root.state()=='iconic':
                 self.drag_surface.withdraw(); return
-            if not self.drag_surface.winfo_ismapped(): self.drag_surface.deiconify()
             target=f'{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_x()}+{self.root.winfo_y()}'
             # Explicit '+' before signed coordinates keeps negative monitor positions
             # absolute; '-1920' in Tk geometry means distance from the right edge.
@@ -175,12 +195,13 @@ class PingFeatureMixin:
                 self.drag_surface.update_idletasks()
             opacity=float(self.cfg.get('background_opacity',0.88))
             if opacity>1: opacity/=100
-            alpha=max(0.01,min(1.0,opacity))
-            self.drag_surface.configure(bg='#202020')
+            alpha=0.0 if getattr(self,'_ping_layer',False) and self.ping_cfg.get('ping_layer_clear_background',True) else max(0.01,min(1.0,opacity))
+            self.drag_surface.configure(bg=self.theme_colors()['root'])
             if abs(float(self.drag_surface.attributes('-alpha'))-alpha)>0.001:
                 self.drag_surface.attributes('-alpha',alpha)
             top=bool(self.root.attributes('-topmost'))
             if bool(self.drag_surface.attributes('-topmost'))!=top: self.drag_surface.attributes('-topmost',top)
+            if not self.drag_surface.winfo_ismapped(): self.drag_surface.deiconify()
             self.drag_surface.lower(self.root)
         except tk.TclError: pass
         finally: self._syncing_drag=False
@@ -292,6 +313,8 @@ class PingFeatureMixin:
         self.worker_queue=queue.Queue(); self.stop_workers=threading.Event()
         self.next_scan=0.; self.next_fetch=0.; self.fetch_busy=False
         self.fetch_error=''; self.fetched_at=None; self.sort_field='name'; self.sort_desc=False
+        self.fetch_started_at=None
+        self.network_log_path=Path(data_dir)/'server_fetch.log'
         self.overlay_width=max(340,min(1400,int(defaults.get('width',390))))
         self.manual_height=defaults.get('height')
         self.ping_widgets={}; self._background_disabled=False
@@ -332,14 +355,15 @@ class PingFeatureMixin:
         order={pair[index][0].casefold():i for i,pair in enumerate(SERVER_NAME_PAIRS)}
         servers=[s for s in self.profiles[region]['servers'] if s['faction']==faction]
         # Retain custom entries after the catalog, without changing their endpoints.
-        return sorted(servers,key=lambda s:order.get(s['name'].casefold(),len(order)))
+        return sorted(servers,key=lambda s:order.get(s['id'].rsplit(':',1)[-1].casefold(),len(order)))
 
     def chosen_endpoints(self):
         ids=set(self.ping_cfg['selected'])
         return [(r,s) for r,s in self.all_endpoints() if s['id'] in ids]
 
     def label(self,parent,text,**kw):
-        return tk.Label(parent,text=text,bg=BG,fg=TEXT,font=self.ui(9),**kw)
+        options=dict(bg=BG,fg=TEXT,font=self.ui(9)); options.update(kw)
+        return tk.Label(parent,text=text,**options)
 
     def button(self,parent,text,command,**kw):
         return tk.Button(parent,text=text,command=command,bg='#202934',fg=TEXT,
@@ -362,8 +386,9 @@ class PingFeatureMixin:
         self.tab_buttons={}
         for key,text in [('events','イベント'),('ping','Ping一覧'),('status','サーバー状態'),('balance','種族バランス')]:
             b=self.button(self.tab_bar,text,lambda k=key:self.show_tab(k),padx=7,pady=5)
-            b.pack(side='left',fill='x',expand=True,padx=1); self.tab_buttons[key]=b
+            b.grid(row=0,column=len(self.tab_buttons),sticky='ew',padx=1); self.tab_bar.columnconfigure(len(self.tab_buttons),weight=1); self.tab_buttons[key]=b
         self.tab_buttons['events'].configure(bg='#344558')
+        self.build_tracker_tabs()
 
     def rebuild_summary(self,transparent='#010203'):
         self.summary_area.clear(); self.summary_rows=[]
@@ -388,6 +413,7 @@ class PingFeatureMixin:
                 self.summary_area.install_wheel(w)
             self.summary_rows.append((server['id'],val,row))
         self.paint_ping()
+        if hasattr(self,'ping_layer_body'): self.rebuild_ping_layer()
 
     def build_extra_tabs(self):
         self.extra_section=tk.Frame(self.root,bg=BG)
@@ -403,6 +429,7 @@ class PingFeatureMixin:
         self._resize_origin=(event.x_root,event.y_root,self.root.winfo_width(),self.root.winfo_height())
 
     def resize_drag(self,event):
+        if getattr(self,'_ping_layer',False): self.resize_ping_layer(event); return
         x,y,w,h=self._resize_origin
         self.overlay_width=max(340,min(1400,w+event.x_root-x))
         target=max(300,min(self.root.winfo_screenheight()-40,h+event.y_root-y))
@@ -418,16 +445,18 @@ class PingFeatureMixin:
 
     def show_tab(self,key):
         self.active_tab=key
+        if getattr(self,'_ping_layer',False): return
         for k,b in self.tab_buttons.items(): b.configure(bg='#344558' if k==key else '#202934')
         self.event_section.pack_forget(); self.timer_box.pack_forget(); self.extra_section.pack_forget()
         if key=='events':
-            self.event_section.pack(fill='x',padx=7,pady=(7,3),after=self.resize_handle)
+            self.event_section.pack(fill='both',expand=True,padx=7,pady=(7,3),after=self.resize_handle)
             if self.timer_panel_visible: self.timer_box.pack(fill='x',padx=7,pady=3,after=self.event_section)
         else:
             self.extra_section.pack(fill='both',expand=True,padx=7,pady=3,after=self.resize_handle)
             for w in self.extra_section.winfo_children(): w.destroy()
             self.ping_widgets={}
-            if key=='ping': self.build_ping_list()
+            if key in ('il','daily','weekly','bosses'): self.build_tracker_view()
+            elif key=='ping': self.build_ping_list()
             else: self.build_db_view()
         self.apply_extension_surface()
         self.ping_generation+=1; self.next_scan=0
@@ -477,35 +506,42 @@ class PingFeatureMixin:
                     w.bind('<Double-Button-1>',lambda e,s=server:self.edit_endpoint(s)); self.list_area.install_wheel(w)
                 self.ping_widgets[server['id']]=value
 
-    def edit_endpoint(self,server):
-        win=self._new_dialog('サーバー接続先の編集'); win.configure(bg=BG)
+    def edit_endpoint(self,server,parent=None,on_saved=None):
+        win=self._new_dialog('サーバー接続先の編集',parent=parent); win.configure(bg=BG)
         win.resizable(False,False)
         self.label(win,server['name']).pack(pady=8)
         fields={}
-        for key,title in [('host','IPアドレス / ホスト名'),('port','TCPポート')]:
+        for key,title in [('name','サーバー名'),('host','IPアドレス / ホスト名'),('port','TCPポート')]:
             self.label(win,title).pack(anchor='w',padx=12)
             var=tk.StringVar(value=str(server[key])); fields[key]=var
             tk.Entry(win,textvariable=var,bg='#10151b',fg=TEXT,insertbackground=TEXT,width=34).pack(padx=12,pady=5)
         self.label(win,server.get('endpoint_note','登録済み接続先'),wraplength=300).pack(padx=12,pady=5)
         def save():
-            host=fields['host'].get().strip()
+            host=fields['host'].get().strip();name=fields['name'].get().strip()
             try:
                 port=int(fields['port'].get())
-                if not host or any(c.isspace() for c in host) or not 1<=port<=65535: raise ValueError()
+                if not name or not host or any(c.isspace() for c in host) or not 1<=port<=65535: raise ValueError()
             except ValueError:
                 messagebox.showerror('入力エラー','ホスト名と1〜65535のポートを指定してください。',parent=win); return
-            server.update(host=host,port=port,endpoint_note='手動設定・対応は利用者確認')
+            server.update(name=name,host=host,port=port,endpoint_note='手動設定・対応は利用者確認')
             self.ping_generation+=1; self.results.clear(); self.next_scan=0; self.save_ping()
             if self.active_tab=='ping': self.render_ping_list()
-            self.paint_ping(); self._safe_dialog_close(win)
-        self.button(win,'保存',save,padx=20,pady=5).pack(pady=9)
-        win.after_idle(lambda:(win.deiconify(),win.lift()))
+            self.rebuild_summary(); self.paint_ping(); self._safe_dialog_close(win)
+            if on_saved:on_saved()
+        save_button=self.button(win,'保存',save,padx=20,pady=5);save_button.pack(pady=9)
+        self._endpoint_editor=dict(win=win,fields=fields,save=save_button)
+        win.after_idle(lambda:self.reveal_dialog(win))
 
     def open_ping_settings(self):
         existing=self._dialog_windows.get('ping')
-        if existing is not None and existing.winfo_exists(): existing.lift(); return
+        if existing is not None and existing.winfo_exists(): self.reveal_dialog(existing); return
         win=self._new_dialog('Ping表示・オーバーレイ設定'); self._dialog_windows['ping']=win
-        win.configure(bg=BG); win.geometry('380x540'); win.minsize(340,400)
+        win.configure(bg=BG); win.geometry('380x600'); win.minsize(340,400)
+        pages=ttk.Notebook(win);pages.pack(fill='both',expand=True,padx=8,pady=8)
+        server_page=tk.Frame(pages,bg=BG);pages.add(server_page,text='サーバー')
+        display_page=tk.Frame(pages,bg=BG);pages.add(display_page,text='表示')
+        display_area=ScrollArea(display_page);display_area.frame.pack(fill='both',expand=True)
+        appearance=display_area.body
         top=tk.BooleanVar(value=self.ping_cfg['topmost'])
         simple=tk.BooleanVar(value=self.ping_cfg.get('simple',False))
         opacity=tk.IntVar(value=self.ping_cfg['transparency'])
@@ -520,27 +556,30 @@ class PingFeatureMixin:
             for dialog in self._dialog_windows.values():
                 if dialog.winfo_exists(): dialog.attributes('-topmost',top.get())
         for title,var in [('オーバーレイを最前面に表示',top),('簡易表示（アンテナ＋数値 ms）',simple)]:
-            tk.Checkbutton(win,text=title,variable=var,bg=BG,fg=TEXT,selectcolor=BG,
+            tk.Checkbutton(appearance,text=title,variable=var,bg=BG,fg=TEXT,selectcolor=BG,
                            command=preview_top if var is top else lambda:None,
                            activebackground=BG,activeforeground=TEXT,font=self.ui(9)).pack(anchor='w',padx=10,pady=2)
-        self.label(win,'透過率 0%（不透明）〜100%（透明）').pack(anchor='w',padx=10)
-        tk.Scale(win,from_=0,to=100,orient='horizontal',variable=opacity,bg=BG,fg=TEXT,
+        self.build_event_emoji_checkbox(appearance)
+        self.build_event_compact_checkbox(appearance)
+        self.build_ping_layer_checkbox(appearance)
+        self.label(appearance,'透過率 0%（不透明）〜100%（透明）').pack(anchor='w',padx=10)
+        tk.Scale(appearance,from_=0,to=100,orient='horizontal',variable=opacity,bg=BG,fg=TEXT,
                  highlightthickness=0,troughcolor='#344558',length=330,command=preview).pack(fill='x',padx=10)
-        tk.Label(win,text='100%でも操作文字・ボタンは残ります',bg=BG,fg=DIM,font=self.ui(8)).pack(anchor='w',padx=10)
+        tk.Label(appearance,text='100%でも操作文字・ボタンは残ります',bg=BG,fg=DIM,font=self.ui(8)).pack(anchor='w',padx=10)
         selected=set(self.ping_cfg['selected']); variables={}
         region_var=tk.StringVar(value=self.ping_cfg['region'])
-        combo=ttk.Combobox(win,textvariable=region_var,values=list(self.profiles),state='readonly')
+        combo=ttk.Combobox(server_page,textvariable=region_var,values=list(self.profiles),state='readonly')
         combo.pack(fill='x',padx=10,pady=6)
         for _,s in self.all_endpoints(): variables[s['id']]=tk.BooleanVar(value=s['id'] in selected)
-        filters=tk.Frame(win,bg=BG); filters.pack(fill='x',padx=10,pady=4)
+        filters=tk.Frame(server_page,bg=BG); filters.pack(fill='x',padx=10,pady=4)
         self.label(filters,'種族').pack(side='left')
-        faction_var=tk.StringVar(value=self.ping_cfg.get('selection_faction','すべて'))
+        faction_var=tk.StringVar(value=self.ping_cfg.get('selection_faction','すべて') if self.ping_cfg.get('selection_faction','すべて') in ('すべて','天族','魔族') else 'すべて')
         faction_box=ttk.Combobox(filters,textvariable=faction_var,
                                 values=['すべて','天族','魔族'],state='readonly',width=16)
         faction_box.pack(side='left',fill='x',expand=True,padx=(10,0))
-        login_row=tk.Frame(win,bg=BG); login_row.pack(fill='x',padx=10)
-        count_label=self.label(win,'',anchor='w'); count_label.pack(fill='x',padx=10,pady=4)
-        area=ScrollArea(win,height=220); area.frame.pack(fill='both',expand=True,padx=10)
+        login_row=tk.Frame(server_page,bg=BG); login_row.pack(fill='x',padx=10)
+        count_label=self.label(server_page,'',anchor='w'); count_label.pack(fill='x',padx=10,pady=4)
+        area=ScrollArea(server_page,height=260); area.frame.pack(fill='both',expand=True,padx=10)
         rows=[]
         def refresh_count():
             total=sum(v.get() for v in variables.values())
@@ -549,6 +588,7 @@ class PingFeatureMixin:
             area.clear(); rows.clear()
             for child in login_row.winfo_children(): child.destroy()
             region=region_var.get()
+            self._ping_selection_state_region=region
             for server in self.ordered_faction_servers(region,'Common'):
                 tk.Checkbutton(login_row,text='LoginServerを表示',variable=variables[server['id']],
                                command=refresh_count,bg=BG,fg=TEXT,selectcolor=BG,
@@ -563,15 +603,22 @@ class PingFeatureMixin:
                                       bg=BG,fg=TEXT,selectcolor=BG,activebackground=BG,
                                       activeforeground=TEXT,anchor='w',font=self.ui(9))
                     cb.pack(fill='x'); area.install_wheel(cb); rows.append(cb)
+                    before_click=[variables[server['id']].get()]
+                    cb.bind('<ButtonPress-1>',lambda e,v=variables[server['id']],old=before_click:old.__setitem__(0,v.get()))
+                    def edit_from_row(e,s=server,v=variables[server['id']],old=before_click):
+                        v.set(old[0]);refresh_count()
+                        self.edit_endpoint(s,parent=win,on_saved=populate)
+                        return 'break'
+                    cb.bind('<Double-Button-1>',edit_from_row)
             refresh_count()
         combo.bind('<<ComboboxSelected>>',populate)
         faction_box.bind('<<ComboboxSelected>>',populate); populate()
-        self.label(win,'先頭のチェックで複数選択 → 保存で表示に反映',wraplength=340).pack(padx=10,pady=5,before=area.frame)
-        self.label(win,'＊既存IP候補・サーバーとの対応は未検証').pack(anchor='w',padx=10,pady=4,before=area.frame)
+        self.label(server_page,'チェックで複数選択 → 保存。名前をダブルクリックで接続先を編集',wraplength=340).pack(padx=10,pady=5,before=area.frame)
+        self.label(server_page,'＊既存IP候補・サーバーとの対応は未検証').pack(anchor='w',padx=10,pady=4,before=area.frame)
         def save():
             chosen=[server['id'] for _,server in self.all_endpoints() if variables[server['id']].get()]
             self.ping_cfg.update(selected=chosen,selection_faction=faction_var.get(),
-                                 topmost=top.get(),simple=simple.get(),transparency=opacity.get())
+                                 topmost=top.get(),simple=simple.get(),transparency=opacity.get(),region=region_var.get())
             self.root.attributes('-topmost',top.get())
             self.cfg['background_opacity']=(100-opacity.get())/100
             self.bg_alpha=self.cfg['background_opacity']; self.apply_background_opacity()
@@ -579,16 +626,16 @@ class PingFeatureMixin:
             self.results.clear(); self.next_scan=0; self.paint_ping()
             self.root.after_idle(self.fit_window_to_content)
             self._dialog_windows.pop('ping',None); self._safe_dialog_close(win)
-        actions=tk.Frame(win,bg=BG); actions.pack(side='bottom',fill='x',padx=10,pady=8,before=area.frame)
+        actions=tk.Frame(win,bg=BG); actions.pack(side='bottom',fill='x',padx=10,pady=8,before=pages)
         save_button=self.button(actions,'保存',save,padx=18,pady=5); save_button.pack(side='right')
         self._ping_selection_state=dict(variables=variables,region=region_var,faction=faction_var,
-                                        rows=rows,populate=populate,save=save_button)
+                                        rows=rows,populate=populate,save=save_button,area=area,pages=pages)
         self.button(actions,'サイズ自動調整',self.reset_size,padx=8,pady=5).pack(side='left')
         def cancel():
             self.cfg['background_opacity']=previous_opacity; self.ping_cfg['topmost']=previous_top
             self.apply_background_opacity(); self._dialog_windows.pop('ping',None); self._safe_dialog_close(win)
         win.protocol('WM_DELETE_WINDOW',cancel)
-        win.after_idle(lambda:(win.deiconify(),win.lift()))
+        win.after_idle(lambda:self.reveal_dialog(win))
 
     def reset_size(self):
         self.overlay_width=390; self.manual_height=None
@@ -622,7 +669,9 @@ class PingFeatureMixin:
         self.list_area.frame.pack(fill='both',expand=True)
         bottom=tk.Frame(self.extra_section,bg=BG); bottom.pack(fill='x',pady=4)
         self.button(bottom,'出典: gaming.tools',lambda:webbrowser.open(SOURCE_URL+('?view=balance' if self.active_tab=='balance' else '')),padx=5).pack(side='left')
-        self.label(bottom,'60秒ごとに自動更新').pack(side='right')
+        self.db_refresh_button=self.button(bottom,'手動更新',lambda:self.request_db_refresh(manual=True),padx=7)
+        self.db_refresh_button.pack(side='right',padx=3)
+        self.label(bottom,'15分ごとにJSON更新').pack(side='right')
         self.render_db()
 
     def choose_db_region(self,code):
@@ -652,7 +701,7 @@ class PingFeatureMixin:
             value=p.get('value')
             if value is None:
                 canvas.create_rectangle(x+i*step,y+height-2,x+(i+1)*step-1,y+height,fill='#59616b',outline=''); continue
-            load=value/capacity if capacity else 0
+            load=value/capacity if capacity else value if capacity is None else 0
             color='#ff5252' if load>=.9 else '#ff9b42' if load>=.7 else '#40c782'
             h=max(1,value/peak*height)
             canvas.create_rectangle(x+i*step,y+height-h,x+(i+1)*step-1,y+height,fill=color,outline='')
@@ -661,11 +710,11 @@ class PingFeatureMixin:
         if self.active_tab not in ('status','balance') or not hasattr(self,'db_info'): return
         self.list_area.clear()
         if not self.db_snapshot:
-            self.db_info.configure(text='取得失敗: '+self.fetch_error if self.fetch_error else 'サーバー情報を取得中…')
+            self.update_db_request_label()
             return
         region_times=[r.get('lastUpdated','') for r in self.db_snapshot['regions']]
         times=[t for t in region_times if t]
-        stamp=min(times) if times else '不明'
+        stamp=min(times) if times else self.db_snapshot.get('generatedAt','不明')
         age=int(time.monotonic()-self.fetched_at) if self.fetched_at else 0
         prefix='更新失敗・前回値を表示中  ' if self.fetch_error else ''
         self.db_info.configure(text=f'{prefix}データ時刻(最古): {stamp}  · 取得 {age}秒前',fg='#ff9b42' if self.fetch_error else DIM)
@@ -674,7 +723,8 @@ class PingFeatureMixin:
         worlds=filtered_servers(self.db_snapshot,self.db_region,self.search_var.get(),status)
         def sortkey(s):
             if self.sort_field=='status': return status_label(s)
-            return s.get(self.sort_field,'')
+            value=s.get(self.sort_field)
+            return (value is None,value if value is not None else '')
         worlds.sort(key=sortkey,reverse=self.sort_desc)
         self.label(self.list_area.body,f'{len(worlds)} サーバー · 検索 / 項目をクリックして並べ替え',anchor='w').pack(fill='x',pady=4)
         if self.table_var.get(): self.render_status_table(worlds)
@@ -687,9 +737,9 @@ class PingFeatureMixin:
                 color='#ff9b42' if server['inMaintenance'] else '#40ff68' if server['isRunning'] else '#ff5252'
                 c.create_text(335,17,text=status_label(server),fill=color,anchor='e',font=self.ui(9))
                 faction='天族' if server['faction']=='Elyos' else '魔族' if server['faction']=='Asmodian' else '不明'
-                c.create_text(8,40,text=f"Faction: {faction}   Region: {server['region']}   Population: {server.get('load',0):.0%}",
+                c.create_text(8,40,text=f"Faction: {faction}   Region: {server['region']}   混雑度: {server.get('load',0):.0%}",
                               fill=TEXT,anchor='w',font=self.ui(8))
-                c.create_text(8,61,text=f"Current: {server['players']:,}   Max: {server['capacity']:,}   Queue: {server['queue']:,}",
+                c.create_text(8,61,text=f"Current: {metric(server.get('players'))}   Max: {metric(server.get('capacity'))}   Queue: {metric(server.get('queue'))}",
                               fill=TEXT,anchor='w',font=self.ui(8))
                 self.draw_spark(c,server['spark'],40,81,290,25,server['capacity']); self.list_area.install_wheel(c)
         if not worlds: self.label(self.list_area.body,'該当するサーバーがありません').pack(pady=20)
@@ -697,7 +747,7 @@ class PingFeatureMixin:
 
     def render_status_table(self,worlds):
         columns=[('Status','status',92),('Server','name',165),('Faction','faction',65),
-                 ('Region','region',60),('Population','load',85),('Current','players',75),
+                 ('Region','region',60),('混雑度','load',85),('Current','players',75),
                  ('Max','capacity',70),('Queue','queue',60),('24H',None,150)]
         head=tk.Frame(self.list_area.body,bg=BG); head.pack(anchor='w')
         offsets=[]; x=0
@@ -709,7 +759,7 @@ class PingFeatureMixin:
             c=tk.Canvas(self.list_area.body,width=x,height=43,bg='#15191e',highlightthickness=0)
             c.pack(anchor='w',pady=1)
             vals=[status_label(server),server['name'],server['faction'],server['region'],f"{server.get('load',0):.0%}",
-                  f"{server['players']:,}",f"{server['capacity']:,}",f"{server['queue']:,}"]
+                  f"{metric(server.get('players'))}",f"{metric(server.get('capacity'))}",f"{metric(server.get('queue'))}"]
             for i,value in enumerate(vals):
                 if i==1: self.draw_name(c,value,offsets[i]+4,21,server['creationBlocked'],self.ui(9))
                 else:
@@ -724,10 +774,13 @@ class PingFeatureMixin:
         self.sort_desc=not self.sort_desc if field==self.sort_field else False
         self.sort_field=field; self.render_db()
 
-    def draw_balance_bar(self,c,elyos,asmo,x,y,width=305):
+    def draw_balance_bar(self,c,elyos,asmo,x,y,width=305,loads=None):
         fraction=balance_fraction(elyos,asmo)
         if fraction is None:
-            text='オンライン人数なし' if elyos==0 and asmo==0 else 'データなし'
+            text='オンライン人数なし' if elyos==0 and asmo==0 else '人口：未確認（公開JSONに人数なし）'
+            if loads:
+                e,a=loads
+                text='人口未確認 · 混雑度 天族 '+(f'{e:.0%}' if e is not None else '未確認')+' / 魔族 '+(f'{a:.0%}' if a is not None else '未確認')
             c.create_text(x,y,text=text,fill=DIM,anchor='w',font=self.ui(9)); return
         c.create_text(x,y,text=f'天族 {fraction:.1%} · {elyos:,} 人',anchor='w',fill=TEXT,font=self.ui(8))
         c.create_text(x+width,y,text=f'魔族 {1-fraction:.1%} · {asmo:,} 人',anchor='e',fill=TEXT,font=self.ui(8))
@@ -749,14 +802,16 @@ class PingFeatureMixin:
                 c.pack(fill='x',pady=2)
                 self.draw_name(c,ename,8,17,bool(e and e['creationBlocked']),self.ui(9,'bold'))
                 self.draw_name(c,aname,185,17,bool(a and a['creationBlocked']),self.ui(9,'bold'))
-                self.draw_balance_bar(c,e['players'] if e else None,a['players'] if a else None,8,43)
-                if e and a:
+                self.draw_balance_bar(c,e['players'] if e else None,a['players'] if a else None,8,43,loads=(e.get('load') if e else None,a.get('load') if a else None))
+                if e and a and e.get('players') is not None and a.get('players') is not None:
                     delta=e['players']-a['players']
                     text='均等' if delta==0 else f"{'天族' if delta>0 else '魔族'} +{abs(delta):,} 人"
                     c.create_text(8,87,text=text,anchor='w',fill=DIM,font=self.ui(8))
                 self.list_area.install_wheel(c)
             for s in unpaired:
-                self.label(self.list_area.body,f"{s['name']} · {s['players']:,} 人 · 公開ペアなし",anchor='w').pack(fill='x',padx=8,pady=3)
+                faction='天族' if s['faction']=='Elyos' else '魔族' if s['faction']=='Asmodian' else '未確認'
+                w=self.label(self.list_area.body,f"{s['name']} · {faction} · {metric(s.get('players'))} 人 · 公開ペア未確認",anchor='w')
+                w.pack(fill='x',padx=8,pady=3); self.list_area.install_wheel(w)
         if not groups: self.label(self.list_area.body,'該当するサーバーがありません').pack(pady=20)
         self.button(self.list_area.body,'公開ペアの出典（2026-10-02時点）',lambda:webbrowser.open(PAIRING_SOURCE),padx=8).pack(pady=10)
         self.apply_extension_surface()
@@ -777,6 +832,7 @@ class PingFeatureMixin:
     def paint_ping(self):
         widgets=list(getattr(self,'ping_widgets',{}).items())
         widgets.extend((sid,w) for sid,w,_ in getattr(self,'summary_rows',[]))
+        widgets.extend((sid,w) for sid,w,_ in getattr(self,'ping_layer_rows',[]))
         for sid,w in widgets:
             if not w.winfo_exists(): continue
             result=self.results.get(sid)
@@ -785,6 +841,7 @@ class PingFeatureMixin:
             else: w.configure(text=f'{result[0]:.1f} ms',fg=latency_color(result[0]))
 
     def poll_network(self):
+        if getattr(self,'_startup_pending',False): return
         if self.stop_workers.is_set(): return
         changed=False
         while True:
@@ -800,22 +857,60 @@ class PingFeatureMixin:
                 else: self.fetch_error=item[2]
                 self.render_db()
         if changed: self.paint_ping()
+        self.update_db_request_label()
         if self._background_disabled: return
         now=time.monotonic()
         if not self.scan_busy and now>=self.next_scan:
             targets={s['id']:copy.deepcopy(s) for _,s in self.chosen_endpoints()}
-            if self.active_tab=='ping': targets.update({s['id']:copy.deepcopy(s) for s in self.visible_endpoints()})
+            if self.active_tab=='ping' and not getattr(self,'_ping_layer',False): targets.update({s['id']:copy.deepcopy(s) for s in self.visible_endpoints()})
             self.next_scan=now+2.5
             if targets:
                 self.scan_busy=True
                 threading.Thread(target=scan,args=(list(targets.values()),self.ping_generation,self.worker_queue,self.stop_workers),daemon=True).start()
-        if not self.fetch_busy and now>=self.next_fetch:
-            self.fetch_busy=True; self.next_fetch=now+60
-            threading.Thread(target=self.fetch_db_worker,daemon=True).start()
+        if not self.fetch_busy and now>=self.next_fetch:self.request_db_refresh()
+
+    def request_db_refresh(self,manual=False):
+        """Manual/automatic requests share one in-flight guard and one deadline."""
+        if self.fetch_busy:return False
+        from server_data import next_fetch_deadline
+        if manual:self._manual_db_schedule=True
+        now=time.monotonic()
+        self.fetch_busy=True;self.fetch_started_at=now
+        self.next_fetch=next_fetch_deadline(now,time.time(),getattr(self,'_manual_db_schedule',False))
+        self.update_db_request_label()
+        threading.Thread(target=self.fetch_db_worker,daemon=True).start()
+        return True
 
     def fetch_db_worker(self):
-        try: self.worker_queue.put(('db',fetch_snapshot(),''))
-        except Exception as exc: self.worker_queue.put(('db',None,str(exc)))
+        started=time.monotonic()
+        try:
+            data=fetch_snapshot()
+            self.worker_queue.put(('db',data,''))
+            outcome=f"成功 / {sum(len(r['servers']) for r in data['regions'])}サーバー"
+        except Exception as exc:
+            outcome=str(exc); self.worker_queue.put(('db',None,outcome))
+        # Only the JSON endpoint is used. Keep a small local diagnostic record;
+        # no headers, IP addresses or response body are written to the log.
+        try:
+            path=self.network_log_path; path.parent.mkdir(parents=True,exist_ok=True)
+            lines=path.read_text(encoding='utf-8').splitlines()[-49:] if path.exists() else []
+            stamp=time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime())
+            lines.append(f'{stamp} / {time.monotonic()-started:.1f}秒 / {outcome}')
+            tmp=path.with_suffix('.tmp'); tmp.write_text('\n'.join(lines)+'\n',encoding='utf-8'); os.replace(tmp,path)
+        except OSError: pass
+
+    def update_db_request_label(self):
+        if self.active_tab not in ('status','balance') or not hasattr(self,'db_info'): return
+        if getattr(self,'db_snapshot',None): return
+        elapsed=max(0,int(time.monotonic()-(getattr(self,'fetch_started_at',None) or time.monotonic())))
+        if self.fetch_busy:
+            text=f'公開JSON取得中… {elapsed}秒（更新間隔15分）'
+            if elapsed>=20: text=f'公開JSONの応答待ちが長くなっています（{elapsed}秒）。重複取得は行いません。'
+        elif getattr(self,'fetch_error',''):
+            remaining=max(0,int(self.next_fetch-time.monotonic()))
+            text=f'取得失敗: {self.fetch_error} / 次回まで {remaining}秒'
+        else: text='公開JSONの取得を開始します（更新間隔15分）'
+        self.db_info.configure(text=text,fg='#ff9b42' if getattr(self,'fetch_error','') else DIM)
 
     def close_ping(self):
         if getattr(self,'tray_icon',None): self.tray_icon.close()

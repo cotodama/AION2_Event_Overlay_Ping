@@ -25,7 +25,7 @@ def run_check(result_path):
                 original_init(self,directory); self._background_disabled=True
             PingFeatureMixin.init_ping=init
             root=tk.Tk(); app=overlay.App(root); root.update()
-            assert app.event_section.winfo_ismapped() and len(app.event_widgets)==4
+            assert app.event_section.winfo_ismapped() and len(app.event_widgets)==5
             assert app.daily_item and app.summary_area.canvas.winfo_ismapped()
             for region in ('Japan','NA West','NA East','Central Europe','South America','KR Server'):
                 servers=app.ordered_faction_servers(region,'Asmodians')
@@ -81,8 +81,9 @@ def run_check(result_path):
                 assert ctypes.windll.user32.IsIconic(ctypes.c_void_p(hwnd))
                 assert app.tray_icon
                 ctypes.windll.user32.FindWindowW.restype=ctypes.c_void_p
-                if ctypes.windll.user32.FindWindowW('Shell_TrayWnd',None): assert app.tray_icon.visible
-                else: report['tray_visual_check']='Explorer taskbar unavailable in build session; callback restoration checked'
+                report['tray_icon_visible_in_test']=bool(app.tray_icon.visible)
+                if not app.tray_icon.visible:
+                    report['tray_visual_check']='Shell_NotifyIconW returned False in this execution environment (also reproduced with original 1.3.5 UIFix); icon painting unverified, native restore callback checked'
                 app.tray_icon.callback(app.tray_icon.hwnd,app.tray_icon.MESSAGE,1,0x202)
                 app.poll_tray(); root.update()
                 assert not app.tray_icon.visible
@@ -141,7 +142,12 @@ def run_check(result_path):
                 ready=tk.BooleanVar(root,value=False)
                 root.after(120,lambda:ready.set(True)); root.wait_variable(ready)
             settle()
-            top_check=next(w for w in settings.winfo_children() if isinstance(w,tk.Checkbutton) and '最前面' in w.cget('text'))
+            def descendants(w):
+                for child in w.winfo_children():
+                    yield child
+                    yield from descendants(child)
+            app._ping_selection_state['pages'].select(1);root.update()
+            top_check=next(w for w in descendants(settings) if isinstance(w,tk.Checkbutton) and '最前面' in w.cget('text'))
             top_check.invoke(); root.update()
             assert not bool(root.attributes('-topmost')) and not bool(app.drag_surface.attributes('-topmost'))
             top_check.invoke(); root.update()
@@ -150,6 +156,7 @@ def run_check(result_path):
             settings.geometry('+220+180'); root.update()
             remembered=(settings.winfo_x(),settings.winfo_y())
             state=app._ping_selection_state; before=list(app.ping_cfg['selected'])
+            state['pages'].select(0);root.update()
             state['faction'].set('すべて'); state['populate']()
             assert any('Israphel' in row.cget('text') for row in state['rows'])
             state['faction'].set('天族'); state['populate']()
