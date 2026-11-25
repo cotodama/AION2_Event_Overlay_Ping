@@ -1,0 +1,32 @@
+[
+  {
+    "name": "gartua",
+    "page": "https://aion2.gaming.tools/ja/npcs/2101074",
+    "url": "https://cdn-hosted.gaming.tools/aion2/images/ui/resource/texture/portrait/portrait_256/ut_256_mob_gartua_01_v02.webp",
+    "sha256": "77c066b115075fd0def724a23eee3863c4faa6c8f5ca090440845557488a0073"
+  },
+  {
+    "name": "ragta",
+    "page": "https://aion2.gaming.tools/ja/npcs/2101131",
+    "url": "https://cdn-hosted.gaming.tools/aion2/images/ui/resource/texture/portrait/portrait_256/ut_256_mob_lagta_01.webp",
+    "sha256": "aea609d21b96272f0e86001416c1e3877991793e4910be03728cdc2896bfbe2b"
+  },
+  {
+    "name": "argo",
+    "page": "https://aion2.gaming.tools/ja/npcs/2600097",
+    "url": "https://cdn-hosted.gaming.tools/aion2/images/ui/resource/texture/portrait/portrait_256/ut_256_mob_eleking_01_v02.webp",
+    "sha256": "083bcf74ee60d5b626f4174268360e1b10a6c53308fd45869ce6946e0c6cbc3b"
+  },
+  {
+    "name": "kaira",
+    "page": "https://aion2.gaming.tools/ja/npcs/2600098",
+    "url": "https://cdn-hosted.gaming.tools/aion2/images/ui/resource/texture/portrait/portrait_256/ut_256_mob_beritrad_01.webp",
+    "sha256": "ff066c1cde01774d82903019c8a18d34179ea5e9c29f0e03b8a1de317746f0ab"
+  },
+  {
+    "name": "nafma",
+    "page": "https://aion2.gaming.tools/ja/npcs/2600084",
+    "url": "https://cdn-hosted.gaming.tools/aion2/images/ui/resource/texture/portrait/portrait_256/ut_256_mob_abboss_01.webp",
+    "sha256": "5208265a4e9d300cd3adc27dd22808dce340b13bd00f4284a18d2c1f7beb4ad0"
+  }
+]
