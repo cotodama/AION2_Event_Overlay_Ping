@@ -1,0 +1,33 @@
+name: Build and publish versioned release
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python tools/build_release.py
+      - run: python tools/package_release.py
+      - name: Add release and preserve all older versions
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          gh release view "v$version" --repo "$env:GITHUB_REPOSITORY" 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "Release v$version already exists; increment VERSION. Existing releases are preserved." }
+          gh release create "v$version" "release/AION2_Event_Overlay_Ping_$version.zip" "release/SHA256SUMS.txt" --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title "AION2 Event Overlay Ping $version" --notes-file .github/RELEASE_NOTES.md --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
