@@ -10,6 +10,11 @@ import json, time, datetime, os, sys, calendar, ctypes, math, struct, wave, temp
 
 # cotodama: Ping/status/balance extension; original scheduling and event UI retained.
 from ping_feature import PingFeatureMixin
+from tracker_feature import TrackerFeatureMixin
+from event_feature import EventFeatureMixin
+from event_model import migrate_config
+from startup_feature import StartupFeatureMixin
+from window_group import WindowGroup, hwnd
 from pathlib import Path
 
 # Tcl needs extended paths for frozen builds under redirected Windows folders.
@@ -20,13 +25,16 @@ if getattr(sys, "frozen", False):
             library_path = "//?/UNC/" + library_path[2:] if library_path.startswith("//") else "//?/" + library_path
         os.environ[variable] = library_path
 
-APP_VERSION = "1.1.0-ping"
+from app_version import VERSION as APP_VERSION
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def resource_path(name):
     """Return a bundled resource path for source and PyInstaller one-file builds."""
     base=getattr(sys,"_MEIPASS",APP_DIR)
-    return os.path.join(base,name)
+    path=os.path.join(base,name)
+    if not getattr(sys,'frozen',False) and not os.path.exists(path):
+        path=os.path.join(os.path.dirname(APP_DIR),name)
+    return path
 
 # Portable settings are separate from the original installed overlay.
 PORTABLE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(APP_DIR)
@@ -62,7 +70,7 @@ DEFAULT_CONFIG = {
 def deep_default():
     return json.loads(json.dumps(DEFAULT_CONFIG, ensure_ascii=False))
 
-def load_config():
+def load_config_raw():
     if not os.path.exists(CONFIG):
         initial=deep_default()
         try:
@@ -81,24 +89,23 @@ def load_config():
         for k,v in DEFAULT_CONFIG.items():
             c.setdefault(k,json.loads(json.dumps(v)))
 
-        # Pre-public default migration. Preserve explicit custom values, but update
-        # untouched Shugo Festa / Battlefield alert defaults from earlier builds.
-        for e in c.get("events",[]):
-            name_en=e.get("name_en","")
-            if name_en=="Shugo Festa":
-                if int(e.get("notify_before_minutes",0) or 0)==0:
-                    e["notify_before_minutes"]=5
-                if e.get("alert_timing","both")=="both":
-                    e["alert_timing"]="start_only"
-            elif name_en=="Battlefield":
-                if "notify_before_minutes" not in e:
-                    e["notify_before_minutes"]=5
-                if "alert_timing" not in e:
-                    e["alert_timing"]="start_only"
         return c
     except Exception as e:
         print(f"[AION2 Overlay] User config read failed; using defaults: {e}")
         return deep_default()
+
+def load_config():
+    original=load_config_raw()
+    if not original.get('schedule_update_137') and os.path.isfile(CONFIG):
+        import shutil
+        if not os.path.exists(CONFIG+'.pre-1.3.7.bak'):shutil.copy2(CONFIG,CONFIG+'.pre-1.3.7.bak')
+    result=migrate_config(original)
+    if result!=original:
+        import shutil
+        if os.path.isfile(CONFIG) and not os.path.exists(CONFIG+'.pre-1.3.0.bak'):
+            shutil.copy2(CONFIG,CONFIG+'.pre-1.3.0.bak')
+        save_config(result)
+    return result
 
 def save_config(c):
     os.makedirs(USER_DATA_DIR,exist_ok=True)
@@ -112,9 +119,11 @@ def fmt(sec):
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 def parse_hm(s):
-    h,m=map(int,s.strip().split(":"))
-    if not (0<=h<=23 and 0<=m<=59): raise ValueError
-    return h*3600+m*60
+    parts=list(map(int,s.strip().split(':')))
+    if len(parts) not in (2,3):raise ValueError
+    h,m=parts[:2];second=parts[2] if len(parts)==3 else 0
+    if not (0<=h<=23 and 0<=m<=59 and 0<=second<=59):raise ValueError
+    return h*3600+m*60+second
 
 def nth_weekday(year, month, weekday, n):
     c=calendar.Calendar().monthdayscalendar(year,month)
@@ -205,11 +214,26 @@ if os.name=="nt":
     _WNDPROC_TYPE=ctypes.WINFUNCTYPE(ctypes.c_ssize_t,ctypes.c_void_p,ctypes.c_uint,ctypes.c_size_t,ctypes.c_ssize_t)
 
 
-class App(PingFeatureMixin):
+from schedule_editor import ScheduleEditorMixin
+from visual_feature import VisualFeatureMixin
+from update_feature import UpdateFeatureMixin
+from server_charts import ServerChartsMixin
+
+from settings_feature import SettingsFeatureMixin
+from timer_view import TimerViewMixin
+from event_view import EventViewMixin
+
+class App(SettingsFeatureMixin, TimerViewMixin, EventViewMixin, ServerChartsMixin, VisualFeatureMixin, UpdateFeatureMixin, ScheduleEditorMixin, StartupFeatureMixin, EventFeatureMixin, TrackerFeatureMixin, PingFeatureMixin):
     def __init__(self,root):
+        self.initialize_startup(root)
         self._dialog_windows = {}
         self.root=root; self.cfg=load_config()
+        self.init_visuals()
+        self.init_updater()
         self.init_ping(USER_DATA_DIR)
+        self.init_tracker(USER_DATA_DIR)
+        self.init_event_notifications(USER_DATA_DIR)
+        self.init_event_map_links()
         self.timers=[TimerState(x) for x in self.cfg["timers"]]
         self.event_alert_state={}
         self.alert_wav=os.path.join(tempfile.gettempdir(),"aion2_event_overlay_alert.wav")
@@ -227,18 +251,17 @@ class App(PingFeatureMixin):
         self.setup_fonts()
         self.build()
         self.install_surface_drag()
+        self.window_group=WindowGroup(self)
         self.apply_main_hud_surface_style()
         self.apply_background_opacity()
-        # Frameless/native styling can recreate the Windows wrapper HWND.
-        # Restore only after that startup work has settled, then enable autosave.
-        self._position_restore_in_progress=True
-        self.root.after(220,self.restore_window_position)
+        self.initialize_ping_layer()
+        from app_audio import AppAudio
+        self.audio=AppAudio(APP_ICON,USER_DATA_DIR)
+        root.bind('<Destroy>',lambda e:self.audio.close() if e.widget is root else None,add='+')
         print(f"[AION2 Overlay] Version {APP_VERSION}; user data={USER_DATA_DIR}")
-        self.root.after(420,self._finish_position_restore)
         root.bind("<Configure>",self.schedule_window_position_save,add="+")
         root.protocol("WM_DELETE_WINDOW",self.on_close)
-        self.tick()
-        self.root.after(250,self.print_native_hwnd_diagnostics)
+        self._startup_after=self.root.after_idle(self.finish_startup)
 
     def setup_fonts(self):
         """Choose Noto Sans JP for UI text and Consolas for clocks/countdowns."""
@@ -277,7 +300,8 @@ class App(PingFeatureMixin):
         """Return ABGR gradient color used by Windows AccentPolicy."""
         # Windows-dark neutral tint: #202020. Alpha controls backdrop strength.
         a=max(0,min(255,int(alpha*255)))
-        r=g=b=0x20
+        color=self.theme_colors()['root'].lstrip('#')
+        r,g,b=(int(color[i:i+2],16) for i in (0,2,4))
         return (a<<24)|(b<<16)|(g<<8)|r
 
     def apply_native_backdrop(self):
@@ -321,15 +345,28 @@ class App(PingFeatureMixin):
             print(f"[AION2 Overlay] Single-HWND alpha tint failed: {exc}")
             return False
 
-    def _new_dialog(self, title):
+    def _new_dialog(self, title, parent=None):
         """Build dialogs hidden; reveal only after their first page is complete."""
-        win=tk.Toplevel(self.root)
+        parent=parent or self.root
+        win=tk.Toplevel(parent)
         win.withdraw()
         win.title(title)
         self.setup_dialog_position(win,title)
+        self.window_group.register(win,parent)
         return win
 
     def _safe_dialog_close(self, win):
+        # Cancel callbacks on their owning Tk widget before destroying it.
+        # Otherwise a short-lived editor can leave an invalid Tcl command queued.
+        try:
+            def descendants(widget):
+                yield widget
+                for child in widget.winfo_children():yield from descendants(child)
+            owners={name:w for w in descendants(win) for name in (w._tclCommands or ())}
+            for callback in self.root.tk.call('after','info'):
+                command=str(self.root.tk.call('after','info',callback)[0])
+                if command in owners:owners[command].after_cancel(callback)
+        except tk.TclError:pass
         try: win.grab_release()
         except Exception: pass
         try: win.destroy()
@@ -349,6 +386,8 @@ class App(PingFeatureMixin):
             else:
                 x=rx+rw+12; y=ry
             win.geometry(f"{width}x{h}+{x}+{y}")
+            from window_placement import clamp_window
+            clamp_window(win)
         except Exception:
             pass
 
@@ -408,6 +447,8 @@ class App(PingFeatureMixin):
                 cls=""
             if cls in interactive_classes:
                 return True
+            if getattr(cur,'_hud_interactive',False):
+                return True
 
             # Do NOT use generic <Button-1> binding detection here.
             # Tk bindings can be inherited/class-level and caused labels,
@@ -435,7 +476,7 @@ class App(PingFeatureMixin):
         rects=[]
         # Existing explicit Button widgets are already detected by class.
         # For canvas/label controls, register widgets that the app marks here.
-        for name in ("btn_timer","btn_settings"):
+        for name in ("btn_timer","btn_settings","ping_layer_grip"):
             w=getattr(self,name,None)
             if w is None:
                 continue
@@ -500,7 +541,7 @@ class App(PingFeatureMixin):
             set_wlp=getattr(user32,"SetWindowLongPtrW",user32.SetWindowLongW)
 
             root_hwnd=int(self.root.winfo_id())
-            hwnds=[root_hwnd]+self._enum_child_hwnds(root_hwnd)
+            hwnds=list(dict.fromkeys([self.get_native_toplevel_hwnd(),root_hwnd]+self._enum_child_hwnds(root_hwnd)))
             self._subclass_records={}
 
             for hwnd in hwnds:
@@ -512,6 +553,8 @@ class App(PingFeatureMixin):
                     @_WNDPROC_TYPE
                     def _proc(hWnd,msg,wParam,lParam,_old=old_proc):
                         try:
+                            if msg in (0x007E,0x02E0,0x001A) and hasattr(self,"window_group"):
+                                self.root.after_idle(self.window_group.display_changed)
                             if msg==WM_NCHITTEST:
                                 self.refresh_hud_control_rects()
                                 x=ctypes.c_short(lParam & 0xFFFF).value
@@ -578,21 +621,7 @@ class App(PingFeatureMixin):
         """Return the real Windows top-level wrapper HWND for the Tk root."""
         if os.name!="nt":
             return int(self.root.winfo_id())
-        self.root.update_idletasks()
-        user32=ctypes.windll.user32
-        hwnd=int(self.root.winfo_id())
-        # Tk commonly exposes a child/client HWND through winfo_id().
-        # Walk parents until the native top-level wrapper is reached.
-        last=hwnd
-        seen=set()
-        while hwnd and hwnd not in seen:
-            seen.add(hwnd)
-            parent=int(user32.GetParent(ctypes.c_void_p(hwnd)) or 0)
-            if not parent:
-                break
-            last=parent
-            hwnd=parent
-        return int(last)
+        return hwnd(self.root)
 
 
     def set_frameless_clickthrough(self, enabled):
@@ -632,15 +661,14 @@ class App(PingFeatureMixin):
         try:
             self.root.update_idletasks()
             self.set_frameless_clickthrough(True)
-            self.root.after(80,lambda:self.set_frameless_clickthrough(True))
-            self.root.after(180,self.apply_background_opacity)
-            self.root.after(300,self.print_native_hwnd_diagnostics)
         except Exception:
             pass
 
     def fit_window_to_content(self):
         """Fit height only; keep the overlay deliberately narrow and stable."""
         try:
+            if getattr(self,'_ping_layer',False): self.size_ping_layer(); return
+            if getattr(self,'_restoring_ping_gui',False): return
             if getattr(self,'window_maximized',False): return
             self.root.update_idletasks()
             x=self.root.winfo_x(); y=self.root.winfo_y()
@@ -678,75 +706,36 @@ class App(PingFeatureMixin):
             pass
 
     def play_mp3(self,path,volume_key="alert_volume",alias="aion2_alert"):
-        """Play an MP3 asynchronously through Windows MCI without extra Python packages."""
-        try:
-            # Stop/close a previous custom MP3 alias first.
-            ctypes.windll.winmm.mciSendStringW(f"stop {alias}",None,0,None)
-            ctypes.windll.winmm.mciSendStringW(f"close {alias}",None,0,None)
-            safe=path.replace('"','')
-            cmd=f'open "{safe}" type mpegvideo alias {alias}'
-            if ctypes.windll.winmm.mciSendStringW(cmd,None,0,None)!=0:
-                return False
-            # MCI volume is 0..1000.
-            vol=max(0,min(100,int(self.cfg.get(volume_key,45))))*10
-            ctypes.windll.winmm.mciSendStringW(f"setaudio {alias} volume to {vol}",None,0,None)
-            return ctypes.windll.winmm.mciSendStringW(f"play {alias}",None,0,None)==0
-        except Exception:
-            return False
+        """Route custom MP3 through the same process-owned mixer session."""
+        volume=max(0,min(100,int(self.cfg.get(volume_key,45))))/100
+        return bool(volume and self.audio.play_file(path,volume,'timer' if 'timer' in alias else 'event'))
 
-    def play_event_alert(self):
-        if winsound is None or int(self.cfg.get("alert_volume",45))<=0:
-            return
-        try:
-            custom=self.cfg.get("alert_sound_file","").strip()
-            if custom and os.path.isfile(custom):
-                ext=os.path.splitext(custom)[1].lower()
-                if ext==".wav":
-                    winsound.PlaySound(custom,winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
-                    return
-                if ext==".mp3" and self.play_mp3(custom):
-                    return
-            # Default: the built-in gentle two-note chime.
-            self.build_alert_wav()
-            winsound.PlaySound(self.alert_wav,winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
-        except Exception:
-            try:
-                winsound.MessageBeep(winsound.MB_OK)
-            except Exception:
-                pass
+    def play_event_alert(self,event=None,preview=False):
+        return EventFeatureMixin.play_event_alert(self,event,preview)
 
     def play_timer_alert(self):
-        """Timer completion alert; independent volume/sound, enabled per timer."""
-        if winsound is None or int(self.cfg.get("timer_alert_volume",45))<=0:
-            return
+        """Timer completion uses its independent gain within the app mixer."""
+        volume=max(0,min(100,int(self.cfg.get('timer_alert_volume',45))))
+        if volume<=0:return False
         try:
-            custom=self.cfg.get("timer_alert_sound_file","").strip()
-            if custom and os.path.isfile(custom):
-                ext=os.path.splitext(custom)[1].lower()
-                if ext==".wav":
-                    winsound.PlaySound(custom,winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
-                    return
-                if ext==".mp3" and self.play_mp3(custom,"timer_alert_volume","aion2_timer_alert"):
-                    return
-            # Slightly longer but still restrained (~0.7 s) three-note completion chime.
-            path=os.path.join(tempfile.gettempdir(),"aion2_timer_overlay_alert.wav")
-            rate=44100
-            volume=max(0,min(100,int(self.cfg.get("timer_alert_volume",45))))/100.0
-            samples=[]
-            for freq,dur in ((523.25,.16),(659.25,.16),(783.99,.24)):
-                count=int(rate*dur)
-                for i in range(count):
-                    tt=i/rate
-                    env=min(1.0,tt/.025)*min(1.0,max(0.0,(dur-tt)/.09))
-                    samples.append(int(32767*.18*volume*env*math.sin(2*math.pi*freq*tt)))
-                samples.extend([0]*int(rate*.045))
-            with wave.open(path,"wb") as wf:
-                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
-                wf.writeframes(b"".join(struct.pack("<h",x) for x in samples))
-            winsound.PlaySound(path,winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
-        except Exception:
-            try: winsound.MessageBeep(winsound.MB_OK)
-            except Exception: pass
+            cache=Path(USER_DATA_DIR)/'sound_cache';cache.mkdir(parents=True,exist_ok=True)
+            path=cache/f'timer-default-{volume}.wav'
+            if not path.exists():
+                rate=44100;gain=volume/100; samples=[]
+                for freq,dur in ((523.25,.16),(659.25,.16),(783.99,.24)):
+                    count=int(rate*dur)
+                    for i in range(count):
+                        tt=i/rate;env=min(1.0,tt/.025)*min(1.0,max(0.0,(dur-tt)/.09))
+                        samples.append(int(32767*.18*gain*env*math.sin(2*math.pi*freq*tt)))
+                    samples.extend([0]*int(rate*.045))
+                with wave.open(str(path),'wb') as wf:
+                    wf.setnchannels(1);wf.setsampwidth(2);wf.setframerate(rate)
+                    wf.writeframes(b''.join(struct.pack('<h',x) for x in samples))
+            custom=str(self.cfg.get('timer_alert_sound_file','')).strip()
+            if custom and Path(custom).is_file() and Path(custom).suffix.lower() in ('.wav','.mp3'):
+                return self.audio.play_file(custom,volume/100,'timer',fallback=str(path))
+            return self.audio.play_file(str(path),1.,'timer')
+        except (ValueError,OSError):return False
 
     def toggle_event_alert(self,e,button=None):
         e["alert_enabled"]=not bool(e.get("alert_enabled",False))
@@ -795,84 +784,16 @@ class App(PingFeatureMixin):
         except Exception:pass
 
 
-    def rebuild_event_widgets(self):
-        c=self.panel_colors()
-        # event_box is the event-card container created by build().
-        # v4.13.0 incorrectly referenced a non-existent events_body attribute.
-        for w in self.event_box.winfo_children():
-            w.destroy()
-        self.event_widgets=[]
-        self.bell_buttons=[]
-        for e in self.cfg["events"]:
-            if not e.get("enabled",True):
-                continue
-            card=tk.Canvas(self.event_box,height=66,bg=HUD_TRANSPARENT_KEY,highlightthickness=0,bd=0)
-            card.pack(fill="x",padx=5,pady=3)
-            # No stipple: transparent Canvas reveals the smooth alpha layer below.
-            bg=card.create_rectangle(1,1,1000,65,fill=HUD_TRANSPARENT_KEY,outline="#555555",
-                                     width=1,tags=("cardbg",))
-            name_item=card.create_text(12,17,text=self.event_name(e),anchor="w",
-                                       fill="#f1f5f9",font=self.ui(10,"bold"))
-            status_item=card.create_text(12,45,text="",anchor="w",
-                                         fill="#dcecff",font=self.small_ui(10,"bold"))
-            time_item=card.create_text(84,45,text="",anchor="w",
-                                       fill="#bcdcff",font=self.mono(12,"bold"))
-            alert_on=bool(e.get("alert_enabled",False))
-            bell_item=card.create_text(100,17,text=("🔔" if alert_on else "🔕"),anchor="e",
-                                       fill=("#dcecff" if alert_on else "#718096"),
-                                       font=self.small_ui(10))
 
-            def resize(ev,cv=card,bg=bg,bell=bell_item):
-                cv.coords(bg,1,1,max(2,ev.width-1),65)
-            card.bind("<Configure>",resize)
-
-            # Genuine square button: same interaction model as timer/settings/+.
-            # It covers a predictable area instead of relying on glyph hit testing.
-            bell_holder={}
-            def bell_button_toggle(e=e,cv=card,bell=bell_item,holder=bell_holder):
-                self.toggle_event_alert(e)
-                on=bool(e.get("alert_enabled",False))
-                cv.itemconfigure(bell,text="",state="hidden")
-                btn=holder.get("button")
-                if btn:
-                    btn.config(text=("🔔" if on else "🔕"),
-                               fg=("#dcecff" if on else "#8b98a6"))
-            card.itemconfigure(bell_item,text="",state="hidden")
-            bell_btn=self.make_hud_square_button(
-                card,("🔔" if alert_on else "🔕"),bell_button_toggle,size=34,
-                font=self.small_ui(10))
-            bell_holder["button"]=bell_btn
-            bell_btn.config(fg=("#dcecff" if alert_on else "#8b98a6"))
-            bell_btn.place(relx=1.0,x=-7,y=7,width=34,height=34,anchor="ne")
-            if not hasattr(self,"bell_buttons"): self.bell_buttons=[]
-            self.bell_buttons.append(bell_btn)
-
-            self.event_widgets.append((e,card,name_item,status_item,time_item))
-
-    def localized_timer_name(self,name):
-        """Translate only built-in/default timer names; preserve user-defined names."""
-        name=str(name or "")
-        lang=self.cfg.get("language","ja")
-        if lang=="en":
-            if name=="新しいタイマー":
-                return "New Timer"
-            m=re.fullmatch(r"タイマー-(\d+)",name)
-            if m:
-                return f"Timer {m.group(1)}"
-        else:
-            if name=="New Timer":
-                return "新しいタイマー"
-            m=re.fullmatch(r"Timer\s+(\d+)",name,re.IGNORECASE)
-            if m:
-                return f"タイマー-{m.group(1)}"
-        return name
 
     def event_name(self,e):
-        if self.cfg.get("language")=="en":
-            return e.get("name_en") or e.get("name_ja") or "Event"
-        return e.get("name_ja") or e.get("name_en") or "イベント"
+        return EventFeatureMixin.event_name(self,e)
 
     def event_status(self,e,jst):
+        if e.get('schedule_edited'):
+            from schedule_edit_model import edited_event_status
+            return edited_event_status(e,jst)
+        if not e.get('schedule_confirmed',True): return 'unknown',0,None
         sod=jst.hour*3600+jst.minute*60+jst.second
         typ=e.get("type","daily")
         if typ=="interval":
@@ -907,103 +828,33 @@ class App(PingFeatureMixin):
             return "next",min(cand) if cand else 7*86400,None
         return "next",0,None
 
-    def rebuild_timers(self):
-        for w in self.timer_content.winfo_children():w.destroy()
-        self.timer_widgets=[]
-        c=self.panel_colors()
-        for timer in self.timers:
-            if not timer.visible: continue
-            f=tk.Frame(self.timer_content,bg=HUD_TRANSPARENT_KEY,
-                       highlightthickness=1,highlightbackground="#52606b")
-            f.pack(fill="x",padx=5,pady=4)
-
-            top=tk.Frame(f,bg=HUD_TRANSPARENT_KEY)
-            top.pack(fill="x",padx=8,pady=(5,2))
-            display_timer_name=self.localized_timer_name(timer.name)
-            tk.Label(top,text=display_timer_name,font=self.ui(10,"bold"),fg="white",
-                     bg=HUD_TRANSPARENT_KEY).pack(side="left",anchor="center")
-
-            def square(parent,text,command,font=None):
-                holder=tk.Frame(parent,bg=HUD_TRANSPARENT_KEY,width=34,height=34)
-                holder.pack(side="right")
-                holder.pack_propagate(False)
-                b=self.make_hud_square_button(holder,text,command,size=34,font=font)
-                b.place(relx=.5,rely=.5,anchor="center",width=34,height=34)
-                return b
-
-            def hide_timer(tmr=timer):
-                tmr.visible=False; self.save_timers(); self.rebuild_timers()
-                self.root.after_idle(self.fit_window_to_content)
-
-            minus=square(top,"−",hide_timer,self.ui(11,"bold"))
-
-            time_row=tk.Frame(f,bg=HUD_TRANSPARENT_KEY)
-            time_row.pack(fill="x",padx=8,pady=(0,2))
-            val=tk.Label(time_row,text=fmt(timer.duration),font=self.mono(18,"bold"),
-                         fg="white",bg=HUD_TRANSPARENT_KEY)
-            val.pack(side="left",anchor="center")
-            finish=tk.Label(time_row,text="",font=self.ui(9,"bold"),fg="#f0b3b3",
-                            bg=HUD_TRANSPARENT_KEY,anchor="e")
-            finish.pack(side="right",anchor="center",padx=(10,0))
-
-            controls=tk.Frame(f,bg=HUD_TRANSPARENT_KEY)
-            controls.pack(fill="x",padx=8,pady=(3,7))
-
-            # Left controls all share exactly the same 34x34 geometry.
-            left=tk.Frame(controls,bg=HUD_TRANSPARENT_KEY)
-            left.pack(side="left")
-            def left_square(text,command,font=None):
-                holder=tk.Frame(left,bg=HUD_TRANSPARENT_KEY,width=34,height=34)
-                holder.pack(side="left",padx=(0,5))
-                holder.pack_propagate(False)
-                b=self.make_hud_square_button(holder,text,command,size=34,font=font)
-                b.place(relx=.5,rely=.5,anchor="center",width=34,height=34)
-                return b
-
-            play_pause=left_square("▶",lambda:None,self.ui(11,"bold"))
-            try:
-                play_pause.place_configure(relx=.5, x=1)
-            except Exception:
-                pass
-            def toggle_timer(tmr=timer,button=play_pause):
-                if tmr.running:
-                    tmr.stop(); button.config(text="▶")
-                else:
-                    tmr.start(); button.config(text="⏸")
-            play_pause.config(command=toggle_timer)
-
-            def reset_timer(tmr=timer,button=play_pause):
-                tmr.reset(); button.config(text="▶")
-            reset_btn=left_square("↻",reset_timer,self.ui(14,"bold"))
-
-            def toggle_timer_alert(tmr=timer,button=None):
-                tmr.alert_enabled=not tmr.alert_enabled
-                if button is not None:
-                    button.config(text=("🔔" if tmr.alert_enabled else "🔕"),
-                                  fg=("#dcecff" if tmr.alert_enabled else "#6f7885"))
-                self.save_timers()
-            bell_holder=tk.Frame(controls,bg=HUD_TRANSPARENT_KEY,width=34,height=34)
-            bell_holder.pack(side="right")
-            bell_holder.pack_propagate(False)
-            bell=self.make_hud_square_button(bell_holder,
-                    "🔔" if timer.alert_enabled else "🔕",lambda:None,size=34,font=self.ui(10))
-            bell.config(fg=("#dcecff" if timer.alert_enabled else "#6f7885"))
-            bell.config(command=lambda tmr=timer,b=bell: toggle_timer_alert(tmr,b))
-            bell.place(relx=.5,rely=.5,anchor="center",width=34,height=34)
-
-            self.timer_widgets.append((timer,val,finish,play_pause))
-
-        if not self.timer_widgets:
-            tk.Label(self.timer_content,text=self.tr(
-                "表示中のタイマーはありません。+ で追加・設定できます。",
-                "No visible timers. Use + to add or configure."),
-                fg="#e1e7ee",bg=HUD_TRANSPARENT_KEY,font=self.ui(9,"bold"),
-                justify="center",anchor="center").pack(fill="x",padx=8,pady=12)
-        if getattr(self,"timer_panel_visible",False):
-            self.root.after_idle(self.fit_window_to_content)
 
     def tick(self):
+        pending=getattr(self,'_tick_after',None)
+        if pending:
+            try: self.root.after_cancel(pending)
+            except tk.TclError: pass
+        self._tick_after=None
+        try:
+            self._tick_once()
+        except Exception:
+            import traceback
+            detail=traceback.format_exc()
+            self.fetch_error='画面更新処理でエラーが発生しました。data/runtime_errors.log を確認してください'
+            try:
+                os.makedirs(USER_DATA_DIR,exist_ok=True)
+                if detail!=getattr(self,'_last_tick_error',None):
+                    with open(os.path.join(USER_DATA_DIR,'runtime_errors.log'),'a',encoding='utf-8') as log:
+                        log.write(datetime.datetime.now(datetime.timezone.utc).isoformat()+'\n'+detail+'\n')
+                    self._last_tick_error=detail
+                self.update_db_request_label()
+            except Exception: pass
+        finally:
+            if self.root.winfo_exists(): self._tick_after=self.root.after(500,self.tick)
+
+    def _tick_once(self):
         self.poll_network()
+        self.tick_tracker(datetime.datetime.now(datetime.timezone.utc))
         # Capture one shared wall-clock snapshot for this entire UI tick.
         # Normalize to the displayed whole second so the clock and every
         # countdown are calculated from exactly the same second boundary.
@@ -1011,52 +862,29 @@ class App(PingFeatureMixin):
         shown,label=display_time(utc,self.cfg.get("display_timezone","JST"))
         self.header_canvas.itemconfigure(self.clock_item,text=shown.strftime("%H:%M:%S")+" "+label)
         jst=utc.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+        self.tick_event_notifications(jst)
+        self.update_field_boss_events(jst)
         reset=jst.replace(hour=16,minute=0,second=0,microsecond=0)
         if jst>=reset:reset+=datetime.timedelta(days=1)
         reset_utc=reset.astimezone(datetime.timezone.utc)
         reset_show,reset_label=display_time(reset_utc,self.cfg.get("display_timezone","JST"))
-        self.header_canvas.itemconfigure(self.daily_item,text=self.tr("デイリー更新 ","Daily Reset ")+reset_show.strftime("%H:%M")+" "+reset_label+"  ("+fmt((reset-jst).total_seconds())+")")
+        self.header_canvas.itemconfigure(self.daily_item,text=self.tr("日次参考 ","Daily reference ")+reset_show.strftime("%H:%M")+" "+reset_label+"  ("+fmt((reset-jst).total_seconds())+")")
         for e,event_canvas,name_item,status_text,status_time in getattr(self,"event_widgets",[]):
             st,sec,remain=self.event_status(e,jst)
-            event_canvas.itemconfigure(name_item,text=self.event_name(e))
+            links_width=len(e.get('map_links',[]))*49
+            right=event_canvas.winfo_width()-48-links_width
+            event_canvas.itemconfigure('headerclock',text=self.event_header_clock(e,jst))
+            header_clock=event_canvas.find_withtag('headerclock')[0]
+            self.layout_event_header(event_canvas,name_item,header_clock,self.event_name(e),right,21 if self.cfg.get('event_compact',False) else 17)
 
-            # Event alerts are based on the countdown crossing a boundary, not on
-            # entry_minutes. This guarantees an alert at the actual start even when
-            # entry countdown is 0.
-            key=id(e)
-            prev=self.event_alert_state.get(key)
-            should_alert=False
-            alert_enabled=bool(e.get("alert_enabled",False))
-            notify_before=max(0,int(e.get("notify_before_minutes",0) or 0))*60
-            alert_timing=e.get("alert_timing","both")  # "both" or "start_only"
-
-            if prev is not None and alert_enabled:
-                prev_st,prev_sec=prev
-
-                # Pre-alert: fire once when the "Next" countdown crosses the
-                # configured N-minutes-before boundary.
-                if alert_timing=="both" and notify_before>0:
-                    if prev_st=="next" and st=="next" and prev_sec>notify_before>=sec:
-                        should_alert=True
-
-                # Start alert: always fire at the event's actual start.
-                # interval/daily with an entry window: next -> entry
-                # windows: next -> active
-                # weekly or entry_minutes=0: countdown rolls from ~0 to the next occurrence
-                start_crossed=False
-                if prev_st=="next" and st in ("entry","active"):
-                    start_crossed=True
-                elif prev_st=="next" and st=="next":
-                    # Normal countdown decreases. A large increase means the previous
-                    # occurrence just started and event_status() rolled to the next one.
-                    if prev_sec<=2 and sec>prev_sec+2:
-                        start_crossed=True
-                if start_crossed:
-                    should_alert=True
-
-            self.event_alert_state[key]=(st,sec)
-            if should_alert:
-                self.play_event_alert()
+            event_canvas.itemconfigure('eventdetails',text=self.event_details(e,jst))
+            if st=='unknown':
+                event_canvas.itemconfigure(status_text,text='未確認（編集で時刻を確認）')
+                event_canvas.itemconfigure(status_time,text='')
+                continue
+            if st=='finished':
+                event_canvas.itemconfigure(status_text,text='終了（右クリックで再設定）')
+                event_canvas.itemconfigure(status_time,text=''); continue
             if st=="entry":
                 label_txt=self.tr("入場時間","ENTRY TIME")
                 time_txt=fmt(sec)
@@ -1066,6 +894,14 @@ class App(PingFeatureMixin):
             else:
                 label_txt=self.tr("次回まで","Next")
                 time_txt=fmt(sec)
+                if e.get('schedule_edited'):
+                    from display_format import precise_remaining
+                    label_txt='次回まで あと'; time_txt=precise_remaining(sec)
+                elif e.get('name_en') in ('Spacetime Rift','Battlefield'):
+                    import math
+                    label_txt='次回まで あと'
+                    from display_format import remaining_text
+                    time_txt=remaining_text(sec)
             event_canvas.itemconfigure(status_text,text=label_txt)
 
             # Color only the time value:
@@ -1084,6 +920,8 @@ class App(PingFeatureMixin):
             bbox=event_canvas.bbox(status_text)
             if bbox:
                 event_canvas.coords(status_time,bbox[2]+7,45)
+        self.refresh_countdown_gauges()
+        self.refresh_button_icons()
         for t,val,finish,play_pause in getattr(self,"timer_widgets",[]):
             rem,o,e=t.vals(); val.config(text=fmt(rem))
             if t.running and rem<=0 and not t.alert_fired:
@@ -1100,18 +938,26 @@ class App(PingFeatureMixin):
                 if play_pause.cget("text")!="▶️":
                     play_pause.config(text="▶️")
                 finish.config(text="")
-        self.root.after(500,self.tick)
 
     def on_close(self):
+        self.close_updater()
+        for callback in (getattr(self,'_tick_after',None),getattr(self,'_sound_after',None),getattr(self,'_startup_after',None)):
+            if callback:
+                try: self.root.after_cancel(callback)
+                except tk.TclError: pass
         if getattr(self,'window_maximized',False): self.toggle_window_maximize()
+        self.audio.close()
+        self.save_tracker()
         self.close_ping()
         self.restore_selective_hit_test()
-        self._position_restore_in_progress=False
-        self.save_window_position()
+        if not getattr(self,'_startup_pending',False):
+            self._position_restore_in_progress=False
+            self.save_window_position()
         try:
             self.save_timers()
         except Exception:
             pass
+        self.cancel_pending_callbacks()
         self.root.destroy()
 
 
@@ -1163,6 +1009,9 @@ class App(PingFeatureMixin):
         try:
             if getattr(self,"_position_restore_in_progress",False):
                 return
+            if getattr(self,'_ping_layer',False):
+                self.ping_cfg['ping_layer_position']={'x':self.root.winfo_x(),'y':self.root.winfo_y()}
+                self.save_ping(); return
             if self.root.state() not in ("normal","zoomed"):
                 return
             self.root.update_idletasks()
@@ -1242,17 +1091,17 @@ class App(PingFeatureMixin):
             10,50,text="",anchor="w",fill="#e2edf7",font=self.ui(10,"bold"))
         # Buttons live in their own right-side row so they never overlap the clock/reset text.
         self.header_buttons=tk.Frame(self.header,bg=HUD_TRANSPARENT_KEY)
-        self.header_buttons.pack(side="right",anchor="ne",padx=7,pady=2)
+        self.header_buttons.pack(side="right",anchor="ne",padx=0,pady=(0,2),before=self.header_info)
         self.window_controls=tk.Frame(self.header_buttons,bg=HUD_TRANSPARENT_KEY)
-        self.window_controls.pack(fill='x',pady=(0,4))
+        self.window_controls.pack(fill='x',pady=(0,6))
         self.minimize_button=self.make_hud_square_button(self.window_controls,'—',self.minimize_window)
         self.maximize_button=self.make_hud_square_button(self.window_controls,'□',self.toggle_window_maximize)
         self.close_button=self.make_hud_square_button(self.window_controls,'×',self.on_close)
-        for btn in (self.minimize_button,self.maximize_button,self.close_button):
-            btn.pack(side='left',ipadx=7,ipady=1,padx=1)
+        for btn in (self.close_button,self.maximize_button,self.minimize_button):
+            btn.pack(side='right',ipadx=7,ipady=1,padx=(2,0))
         self.close_button.configure(bg='#823139',activebackground='#b43b43')
         self.header_actions=tk.Frame(self.header_buttons,bg=HUD_TRANSPARENT_KEY)
-        self.header_actions.pack(fill='x')
+        self.header_actions.pack(fill='x',padx=(0,7))
         def header_square(text,command):
             holder=tk.Frame(self.header_actions,bg=HUD_TRANSPARENT_KEY,width=34,height=34)
             holder.pack(side="left",padx=2)
@@ -1266,18 +1115,25 @@ class App(PingFeatureMixin):
         self.move_button.bind("<ButtonPress-1>",self._move_handle_start)
         self.move_button.bind("<B1-Motion>",self._move_handle_drag)
         self.move_button.bind("<ButtonRelease-1>",self._move_handle_end)
-        header_square("⚙",self.settings)
+        self.ping_layer_button=header_square('',lambda:self.set_ping_layer(True))
+        self.install_antenna_icon(self.ping_layer_button)
+        self.settings_button=header_square("⚙",self.settings)
 
         self.build_ping_header(HUD_TRANSPARENT_KEY)
 
         self.event_section=tk.Frame(self.root,bg=HUD_TRANSPARENT_KEY)
-        self.event_section.pack(fill="x",padx=7,pady=(7,3))
-        self.event_title=tk.Label(self.event_section,text=self.tr("イベント","EVENTS"),
+        self.event_section.pack(fill="both",expand=True,padx=7,pady=(7,3))
+        self.event_title=tk.Label(self.event_section,text=self.tr("イベント（右クリックで名前・時刻を編集）","EVENTS (right-click to edit)"),
                                   font=self.ui(10,"bold"),fg="#f5f5f5",
                                   bg=HUD_TRANSPARENT_KEY)
         self.event_title.pack(anchor="w",padx=4,pady=(0,3))
-        self.event_box=tk.Frame(self.event_section,bg=HUD_TRANSPARENT_KEY)
-        self.event_box.pack(fill="x")
+        self.event_notice_label=tk.Label(self.event_section,text='',font=self.ui(8),fg='#ffd54a',
+                                         bg=HUD_TRANSPARENT_KEY,justify='left',anchor='w',wraplength=350)
+        from ping_feature import ScrollArea
+        self.event_scroll=ScrollArea(self.event_section,height=350,bg=HUD_TRANSPARENT_KEY)
+        self.event_scroll.frame.pack(fill='both',expand=True)
+        self.event_box=self.event_scroll.body
+
         self.event_widgets=[]
         self.rebuild_event_widgets()
         self.timer_box=tk.Frame(self.root,bg=c["root"])
@@ -1319,494 +1175,12 @@ class App(PingFeatureMixin):
             self.stopwatch_button.config(relief="flat")
         self.root.after_idle(self.fit_window_to_content)
 
-    def open_timer_settings(self):
-        if not hasattr(self, "_dialog_windows"):
-            self._dialog_windows = {}
-        existing=self._dialog_windows.get("timer")
-        try:
-            if existing is not None and existing.winfo_exists():
-                existing.deiconify(); existing.lift()
-                return
-        except Exception:
-            pass
-        c=self.panel_colors()
-        win=self._new_dialog(self.tr("タイマー設定","Timer Settings"))
-        self._dialog_windows["timer"]=win
-        def close_dialog():
-            self._dialog_windows.pop("timer",None)
-            self._safe_dialog_close(win)
-        win.protocol("WM_DELETE_WINDOW",close_dialog)
-        win.configure(bg=c["root"])
-        win.resizable(False,False)
-
-        # Keep this dialog deliberately narrow: the overlay's design language is
-        # vertical and compact, not a wide desktop settings sheet.
-        outer=tk.Frame(win,bg=c["root"])
-        outer.pack(fill="both",expand=True,padx=8,pady=8)
-
-        head=tk.Frame(outer,bg=c["header"],height=38)
-        head.pack(fill="x"); head.pack_propagate(False)
-        tk.Label(head,text=self.tr("タイマー設定","TIMER SETTINGS"),
-                 font=self.ui(12,"bold"),fg="white",bg=c["header"]).pack(
-                     side="left",padx=9)
-
-        def save_all():
-            self.save_timers()
-            self.rebuild_timers()
-            if getattr(self,"timer_panel_visible",False):
-                self.root.after_idle(self.fit_window_to_content)
-
-        def delete_one(timer):
-            if timer in self.timers:
-                self.timers.remove(timer)
-            save_all(); refresh()
-
-        def add_timer():
-            self.timers.append(TimerState({
-                "name":self.tr("新しいタイマー","New Timer"),
-                "duration":300,"visible":False,"alert_enabled":True
-            }))
-            save_all(); refresh()
-
-        add_holder=tk.Frame(head,bg=c["header"],width=30,height=30)
-        add_holder.pack(side="right",padx=5,pady=4); add_holder.pack_propagate(False)
-        self.make_hud_square_button(add_holder,"+",add_timer,size=30).place(
-            x=0,y=0,width=30,height=30)
-
-        body_wrap=tk.Frame(outer,bg=c["root"])
-        body_wrap.pack(fill="both",expand=True,pady=(5,0))
-        canvas=tk.Canvas(body_wrap,bg=c["root"],highlightthickness=0,
-                         borderwidth=0,width=346,height=360)
-        scrollbar=tk.Scrollbar(body_wrap,orient="vertical",command=canvas.yview)
-        body=tk.Frame(canvas,bg=c["root"])
-        body_id=canvas.create_window((0,0),window=body,anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left",fill="both",expand=True)
-        scrollbar.pack(side="right",fill="y")
-
-        def wheel(event):
-            d=getattr(event,"delta",0)
-            if d: canvas.yview_scroll(-1 if d>0 else 1,"units")
-            return "break"
-        win.bind("<MouseWheel>",wheel,add="+")
-        def bind_wheel(w):
-            try: w.bind("<MouseWheel>",wheel,add="+")
-            except Exception: pass
-            for ch in w.winfo_children(): bind_wheel(ch)
-
-        def sync_scroll(_=None):
-            try:
-                canvas.configure(scrollregion=canvas.bbox("all"))
-                canvas.itemconfigure(body_id,width=canvas.winfo_width())
-            except Exception: pass
-        body.bind("<Configure>",sync_scroll)
-        canvas.bind("<Configure>",sync_scroll)
-
-        def fit_settings():
-            # Same outer width as the main Settings dialog.
-            # Height follows the timer-card content and is capped; overflow scrolls.
-            try:
-                win.update_idletasks()
-                content_h=max(1, body.winfo_reqheight())
-                # header/outer chrome ~= 64px; keep a practical minimum for 1 timer.
-                target_h=max(205, min(525, content_h + 64))
-            except Exception:
-                target_h=360
-            self._place_compact_dialog(win,390,target_h)
-
-        def refresh():
-            for child in body.winfo_children(): child.destroy()
-            if not self.timers:
-                tk.Label(body,text=self.tr("タイマーはありません。＋で追加できます。",
-                    "No timers. Use + to add one."),fg="#b8c4d0",bg=c["root"],
-                    font=self.ui(9,"bold")).pack(fill="x",pady=20)
-                win.after_idle(sync_scroll); win.after_idle(fit_settings); return
-
-            for index,timer in enumerate(self.timers,1):
-                card=tk.Frame(body,bg=c["card"],highlightthickness=1,
-                              highlightbackground="#303842")
-                card.pack(fill="x",pady=(0,5))
-
-                # One compact title strip.
-                title=tk.Frame(card,bg=c["header"],height=28)
-                title.pack(fill="x"); title.pack_propagate(False)
-                tk.Label(title,text=f"{self.tr('タイマー','Timer')} {index}",
-                         fg="white",bg=c["header"],
-                         font=self.ui(9,"bold")).pack(side="left",padx=8)
-
-                inner=tk.Frame(card,bg=c["card"])
-                inner.pack(fill="x",padx=8,pady=6)
-
-                # Name and duration use short, dense rows instead of large form blocks.
-                name_row=tk.Frame(inner,bg=c["card"]); name_row.pack(fill="x",pady=(0,4))
-                tk.Label(name_row,text=self.tr("名称","Name"),fg="#bcdcff",bg=c["card"],
-                         font=self.ui(8,"bold"),width=5,anchor="w").pack(side="left")
-                name=tk.Entry(name_row,bg=c["header"],fg="white",insertbackground="white",
-                              relief="flat",font=self.ui(9))
-                name.insert(0,self.localized_timer_name(timer.name))
-                name.pack(side="left",fill="x",expand=True,ipady=2)
-
-                time_row=tk.Frame(inner,bg=c["card"]); time_row.pack(fill="x")
-                tk.Label(time_row,text=self.tr("時間","Time"),fg="#bcdcff",bg=c["card"],
-                         font=self.ui(8,"bold"),width=5,anchor="w").pack(side="left")
-                total=max(1,int(timer.duration))
-                hv=tk.IntVar(value=total//3600); mv=tk.IntVar(value=(total%3600)//60)
-                sv=tk.IntVar(value=total%60)
-                controls=tk.Frame(time_row,bg=c["card"]); controls.pack(side="left")
-                def spin(var,maximum,unit):
-                    box=tk.Frame(controls,bg=c["card"]); box.pack(side="left",padx=(0,3))
-                    sp=tk.Spinbox(box,from_=0,to=maximum,textvariable=var,width=2,
-                                  bg=c["header"],fg="white",buttonbackground=c["button"],
-                                  insertbackground="white",relief="flat",
-                                  font=self.mono(9),justify="center")
-                    sp.pack(side="left",ipady=1)
-                    tk.Label(box,text=unit,fg="#f5f5f5",bg=c["card"],
-                             font=self.ui(8)).pack(side="left",padx=(2,0))
-                spin(hv,999,self.tr("時","h")); spin(mv,59,self.tr("分","m"))
-                spin(sv,59,self.tr("秒","s"))
-
-                # Save/Delete share the same row as the duration controls.
-                # This uses the otherwise empty right-hand space and shortens each card.
-                actions=tk.Frame(time_row,bg=c["card"])
-                actions.pack(side="right",padx=(4,0))
-                def apply_one(timer=timer,name=name,hv=hv,mv=mv,sv=sv):
-                    try:
-                        h=int(hv.get()); m=int(mv.get()); s=int(sv.get())
-                        if h<0 or not 0<=m<=59 or not 0<=s<=59: raise ValueError
-                        duration=h*3600+m*60+s
-                        if duration<=0: raise ValueError
-                        timer.name=name.get().strip() or self.tr("タイマー","Timer")
-                        timer.duration=duration; timer.visible=True; timer.reset()
-                        save_all()
-                    except Exception:
-                        messagebox.showerror("Error",self.tr(
-                            "時間は「時・分・秒」で正しく入力してください。0秒にはできません。",
-                            "Enter a valid hours/minutes/seconds duration. Duration cannot be zero."
-                        ),parent=win)
-                tk.Button(actions,text=self.tr("削除","Delete"),
-                          command=lambda timer=timer:delete_one(timer),
-                          bg="#4a2929",fg="white",activebackground="#623235",
-                          activeforeground="white",relief="flat",cursor="hand2",
-                          font=self.ui(8),padx=6,pady=1).pack(side="right")
-                tk.Button(actions,text=self.tr("保存","Save"),command=apply_one,
-                          bg=c["button"],fg="white",activebackground="#26394d",
-                          activeforeground="white",relief="flat",cursor="hand2",
-                          font=self.ui(8,"bold"),padx=7,pady=1).pack(
-                              side="right",padx=(0,4))
-
-            bind_wheel(body)
-            win.after_idle(sync_scroll); win.after_idle(fit_settings)
-
-        refresh()
-        win.after_idle(lambda:(fit_settings(),win.deiconify(),win.lift()))
-
-    def settings(self):
-        if not hasattr(self, "_dialog_windows"):
-            self._dialog_windows = {}
-        existing=self._dialog_windows.get("settings")
-        try:
-            if existing is not None and existing.winfo_exists():
-                existing.deiconify(); existing.lift()
-                return
-        except Exception:
-            pass
-        c=self.panel_colors()
-        win=self._new_dialog(self.tr("設定","Settings"))
-        self._dialog_windows["settings"]=win
-        def close_dialog():
-            self._dialog_windows.pop("settings",None)
-            self._safe_dialog_close(win)
-        win.protocol("WM_DELETE_WINDOW",close_dialog)
-        win.configure(bg=c["root"])
-        win.resizable(False,False)
-
-        outer=tk.Frame(win,bg=c["root"])
-        outer.pack(fill="both",expand=True,padx=8,pady=8)
-        head=tk.Frame(outer,bg=c["header"]); head.pack(fill="x")
-        # Header controls use the same vertical center line.
-        head.configure(height=44)
-        head.pack_propagate(False)
-        tk.Label(head,text=self.tr("設定","SETTINGS"),font=self.ui(13,"bold"),
-                 fg="white",bg=c["header"]).pack(side="left",padx=10,fill="y")
-        tk.Button(head,text=self.tr("オーバーレイを閉じる","Close Overlay"),
-                  bg="#5b2327",activebackground="#743038",
-                  fg="white",activeforeground="white",
-                  relief="flat",bd=0,font=self.ui(9,"bold"),cursor="hand2",
-                  command=self.on_close).pack(side="right",padx=6,pady=7)
-
-        tabs=tk.Frame(outer,bg=c["root"]); tabs.pack(fill="x",pady=(7,4))
-        content=tk.Frame(outer,bg=c["root"]); content.pack(fill="both",expand=True)
-        pages={}
-        tab_buttons={}
-
-        def fit_settings():
-            self._place_compact_dialog(win,390,260)
-
-        def show_page(key):
-            for k,p in pages.items(): p.pack_forget()
-            pages[key].pack(fill="both",expand=True)
-            for k,b in tab_buttons.items(): b.config(relief="sunken" if k==key else "flat")
-            win.after_idle(fit_settings)
-
-        for key,label in (("events",self.tr("イベント","Events")),("display",self.tr("表示","Display")),("alerts",self.tr("アラート","Alerts")),("info",self.tr("情報","Info"))):
-            b=tk.Button(tabs,text=label,bg=c["button"],fg="white",relief="flat",font=self.ui(9,"bold"),command=lambda k=key:show_page(k))
-            b.pack(side="left",padx=(0,4)); tab_buttons[key]=b
-            pages[key]=tk.Frame(content,bg=c["root"])
-
-        # Events page -- cards matching the overlay rather than a native ttk table.
-        ef=pages["events"]
-        event_list=tk.Frame(ef,bg=c["root"]); event_list.pack(fill="both",expand=True)
-        event_actions=tk.Frame(ef,bg=c["root"]); event_actions.pack(fill="x",pady=(6,0))
-        selected={"index":None}
-
-        def refresh_events():
-            for w in event_list.winfo_children(): w.destroy()
-            selected["index"]=None
-            for i,e in enumerate(self.cfg["events"]):
-                card=tk.Frame(event_list,bg=c["card"],highlightthickness=1,highlightbackground="#252c35")
-                card.pack(fill="x",pady=3)
-                left=tk.Frame(card,bg=c["card"]); left.pack(side="left",fill="both",expand=True,padx=9,pady=7)
-                tk.Label(left,text=self.event_name(e),font=self.ui(10,"bold"),fg="#ffffff",bg=c["card"]).pack(anchor="w")
-                state=f'{e.get("type","daily")} / {"ON" if e.get("enabled",True) else "OFF"}'
-                tk.Label(left,text=state,font=self.ui(8),fg="#8fa0b5",bg=c["card"]).pack(anchor="w",pady=(2,0))
-                actions=tk.Frame(card,bg=c["card"]); actions.pack(side="right",padx=7,pady=7)
-                tk.Button(actions,text=self.tr("編集","Edit"),bg=c["button"],fg="white",relief="flat",command=lambda i=i:self.edit_event(win,i,refresh_events)).pack(side="left",padx=2)
-                def delete_event(i=i):
-                    del self.cfg["events"][i]; save_config(self.cfg); self.rebuild_event_widgets(); refresh_events(); win.after_idle(fit_settings)
-                tk.Button(actions,text=self.tr("削除","Delete"),bg="#4a2929",fg="white",relief="flat",command=delete_event).pack(side="left",padx=2)
-            win.after_idle(fit_settings)
-
-        tk.Button(event_actions,text="＋ "+self.tr("イベント追加","Add Event"),bg=c["button"],fg="white",relief="flat",command=lambda:self.edit_event(win,None,refresh_events)).pack(side="left")
-        refresh_events()
-
-        # Display page -- same charcoal cards/buttons as the main overlay.
-        df=pages["display"]
-        card=tk.Frame(df,bg=c["card"],highlightthickness=1,highlightbackground="#252c35"); card.pack(fill="x",pady=3)
-        form=tk.Frame(card,bg=c["card"]); form.pack(fill="x",padx=10,pady=9)
-        def form_label(txt): tk.Label(form,text=txt,font=self.ui(9,"bold"),fg="#f5f5f5",bg=c["card"]).pack(anchor="w",pady=(7,3))
-        combo_style={"state":"readonly","font":self.ui(9)}
-        form_label("Language")
-        lv=tk.StringVar(value="English" if self.cfg.get("language")=="en" else "日本語")
-        lbox=ttk.Combobox(form,textvariable=lv,values=["日本語","English"],**combo_style); lbox.pack(fill="x")
-        form_label(self.tr("表示時間帯","Display Time Zone"))
-        zv=tk.StringVar(value=self.cfg.get("display_timezone","JST")); ttk.Combobox(form,textvariable=zv,values=["JST","PDT","CEST"],**combo_style).pack(fill="x")
-        form_label(self.tr("背景の透過度","HUD background opacity"))
-        op=tk.Scale(form,from_=20,to=100,orient="horizontal",showvalue=True,bg=c["card"],fg="white",highlightthickness=0,troughcolor=c["header"],activebackground=c["button"],length=360,command=self.preview_background_opacity)
-        _op=float(self.cfg.get("background_opacity",.70)); _op=_op/100.0 if _op>1.0 else _op; op.set(int(_op*100)); op.pack(fill="x")
-        def apply_display():
-            self.cfg["language"]="en" if lv.get()=="English" else "ja"
-            self.cfg["display_timezone"]=zv.get()
-            self.cfg["background_opacity"]=max(.05,min(1.0,op.get()/100))
-            self.cfg.pop("opacity",None)
-            save_config(self.cfg)
-
-            # Apply language immediately. Previously the static HUD labels and timer
-            # area were only rebuilt after another action (e.g. creating a timer).
-            try:
-                self.event_title.config(text=self.tr("イベント","EVENTS"))
-                self.timer_title.config(text=self.tr("タイマー","TIMERS"))
-                self.rebuild_event_widgets()
-                self.rebuild_timers()
-                self.tick()
-            except Exception as exc:
-                print(f"[AION2 Overlay] Language refresh warning: {exc}")
-
-            self.apply_main_hud_surface_style()
-            self.apply_frameless_mode()
-            self.apply_background_opacity()
-            win.destroy()
-        tk.Button(df,text=self.tr("適用","Apply"),command=apply_display,bg=c["button"],fg="white",relief="flat",font=self.ui(9,"bold")).pack(anchor="e",pady=(6,0))
-
-        # Alerts page
-        af=pages["alerts"]
-        acard=tk.Frame(af,bg=c["card"],highlightthickness=1,highlightbackground="#252c35")
-        acard.pack(fill="x",pady=3)
-        aform=tk.Frame(acard,bg=c["card"]); aform.pack(fill="x",padx=10,pady=10)
-
-        tk.Label(aform,text=self.tr("イベントアラート音量","Event alert volume"),
-                 font=self.ui(9,"bold"),fg="#f5f5f5",bg=c["card"]).pack(anchor="w")
-        av=tk.Scale(aform,from_=0,to=100,orient="horizontal",showvalue=True,bg=c["card"],fg="white",
-                    highlightthickness=0,troughcolor=c["header"],activebackground=c["button"],length=360)
-        av.set(int(self.cfg.get("alert_volume",45))); av.pack(fill="x",pady=(3,10))
-
-        tk.Label(aform,text=self.tr("アラート音","Alert sound"),
-                 font=self.ui(9,"bold"),fg="#f5f5f5",bg=c["card"]).pack(anchor="w")
-
-        sound_var=tk.StringVar()
-        custom_path=self.cfg.get("alert_sound_file","").strip()
-        sound_var.set(custom_path if custom_path else self.tr("デフォルト（ソフトチャイム）","Default (soft chime)"))
-
-        sound_row=tk.Frame(aform,bg=c["card"]); sound_row.pack(fill="x",pady=(3,5))
-        sound_entry=tk.Entry(sound_row,textvariable=sound_var,state="readonly",
-                             readonlybackground=c["header"],fg="white",relief="flat",font=self.ui(9))
-        sound_entry.pack(side="left",fill="x",expand=True,ipady=4)
-
-        def choose_sound():
-            path=filedialog.askopenfilename(
-                parent=win,
-                title=self.tr("アラート音を選択","Choose alert sound"),
-                filetypes=[(self.tr("音声ファイル","Audio files"),"*.wav *.mp3"),
-                           ("WAV","*.wav"),("MP3","*.mp3")]
-            )
-            if path:
-                sound_var.set(path)
-
-        def use_default_sound():
-            sound_var.set(self.tr("デフォルト（ソフトチャイム）","Default (soft chime)"))
-
-        tk.Button(sound_row,text=self.tr("参照","Browse"),command=choose_sound,
-                  bg=c["button"],fg="white",relief="flat",font=self.ui(9),padx=8).pack(side="left",padx=(6,0))
-        tk.Button(sound_row,text=self.tr("既定","Default"),command=use_default_sound,
-                  bg=c["button"],fg="white",relief="flat",font=self.ui(9),padx=8).pack(side="left",padx=(4,0))
-
-        tk.Label(aform,text=self.tr(
-            "WAV/MP3ファイルを選択できます。\n「既定」で内蔵のソフトチャイムに戻ります。",
-            "Choose a WAV or MP3 file, or use Default to return to the built-in soft chime."
-        ),font=self.ui(8),fg="#7d8795",bg=c["card"],justify="left",
-           anchor="w",wraplength=330).pack(fill="x",pady=(0,8))
-
-        def selected_sound_path():
-            v=sound_var.get().strip()
-            default_labels={
-                "デフォルト（ソフトチャイム）",
-                "Default (soft chime)"
-            }
-            return "" if v in default_labels else v
-
-        alert_actions=tk.Frame(aform,bg=c["card"]); alert_actions.pack(fill="x")
-
-        def preview_alert():
-            old_volume=self.cfg.get("alert_volume",45)
-            old_sound=self.cfg.get("alert_sound_file","")
-            self.cfg["alert_volume"]=av.get()
-            self.cfg["alert_sound_file"]=selected_sound_path()
-            self.play_event_alert()
-            self.cfg["alert_volume"]=old_volume
-            self.cfg["alert_sound_file"]=old_sound
-
-        def apply_alerts():
-            path=selected_sound_path()
-            if path and (not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in (".wav",".mp3")):
-                messagebox.showerror(
-                    self.tr("音声ファイルエラー","Audio file error"),
-                    self.tr("有効なWAVまたはMP3ファイルを選択してください。","Please choose a valid WAV or MP3 file."),
-                    parent=win
-                )
-                return
-            self.cfg["alert_volume"]=av.get()
-            self.cfg["alert_sound_file"]=path
-            save_config(self.cfg)
-
-        tk.Button(alert_actions,text=self.tr("試聴","Preview"),command=preview_alert,
-                  bg=c["button"],fg="white",relief="flat",font=self.ui(9),
-                  padx=10,pady=3,cursor="hand2").pack(side="left")
-        tk.Button(alert_actions,text=self.tr("適用","Apply"),command=apply_alerts,
-                  bg=c["button"],fg="white",relief="flat",font=self.ui(9,"bold"),
-                  padx=10,pady=3,cursor="hand2").pack(side="right")
-
-        # Timer alerts (independent from event alerts)
-        tcard=tk.Frame(af,bg=c["card"],highlightthickness=1,highlightbackground="#252c35")
-        tcard.pack(fill="x",pady=(8,3))
-        tf=tk.Frame(tcard,bg=c["card"]); tf.pack(fill="x",padx=10,pady=10)
-        tk.Label(tf,text=self.tr("タイマーアラート音量","Timer alert volume"),
-                 font=self.ui(9,"bold"),fg="#f5f5f5",bg=c["card"]).pack(anchor="w")
-        tav=tk.Scale(tf,from_=0,to=100,orient="horizontal",showvalue=True,bg=c["card"],fg="white",
-                     highlightthickness=0,troughcolor=c["header"],activebackground=c["button"],length=360)
-        tav.set(int(self.cfg.get("timer_alert_volume",45))); tav.pack(fill="x",pady=(3,10))
-        tk.Label(tf,text=self.tr("タイマーアラート音","Timer alert sound"),
-                 font=self.ui(9,"bold"),fg="#f5f5f5",bg=c["card"]).pack(anchor="w")
-        tsound_var=tk.StringVar()
-        tp=self.cfg.get("timer_alert_sound_file","").strip()
-        tsound_var.set(tp if tp else self.tr("デフォルト（タイマーチャイム）","Default (timer chime)"))
-        tsrow=tk.Frame(tf,bg=c["card"]); tsrow.pack(fill="x",pady=(3,5))
-        tse=tk.Entry(tsrow,textvariable=tsound_var,state="readonly",readonlybackground=c["header"],
-                     fg="white",relief="flat",font=self.ui(9))
-        tse.pack(side="left",fill="x",expand=True,ipady=4)
-        def choose_timer_sound():
-            path=filedialog.askopenfilename(parent=win,title=self.tr("タイマーアラート音を選択","Choose timer alert sound"),
-                filetypes=[(self.tr("音声ファイル","Audio files"),"*.wav *.mp3"),("WAV","*.wav"),("MP3","*.mp3")])
-            if path: tsound_var.set(path)
-        def default_timer_sound():
-            tsound_var.set(self.tr("デフォルト（タイマーチャイム）","Default (timer chime)"))
-        tk.Button(tsrow,text=self.tr("参照","Browse"),command=choose_timer_sound,bg=c["button"],fg="white",
-                  relief="flat",font=self.ui(9),padx=8).pack(side="left",padx=(6,0))
-        tk.Button(tsrow,text=self.tr("既定","Default"),command=default_timer_sound,bg=c["button"],fg="white",
-                  relief="flat",font=self.ui(9),padx=8).pack(side="left",padx=(4,0))
-        tk.Label(tf,text=self.tr("WAV/MP3ファイルを選択できます。\n「既定」で内蔵のタイマーチャイムに戻ります。",
-                                 "Choose a WAV/MP3 file.\nDefault restores the built-in timer chime."),
-                 font=self.ui(8),fg="#7d8795",bg=c["card"],justify="left",anchor="w",wraplength=330).pack(fill="x",pady=(0,8))
-        def timer_sound_path():
-            v=tsound_var.get().strip()
-            return "" if v in {"デフォルト（タイマーチャイム）","Default (timer chime)"} else v
-        ta=tk.Frame(tf,bg=c["card"]); ta.pack(fill="x")
-        def preview_timer_alert():
-            ov=self.cfg.get("timer_alert_volume",45); osf=self.cfg.get("timer_alert_sound_file","")
-            self.cfg["timer_alert_volume"]=tav.get(); self.cfg["timer_alert_sound_file"]=timer_sound_path()
-            self.play_timer_alert()
-            self.cfg["timer_alert_volume"]=ov; self.cfg["timer_alert_sound_file"]=osf
-        def apply_timer_alert():
-            path=timer_sound_path()
-            if path and (not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in (".wav",".mp3")):
-                messagebox.showerror(self.tr("音声ファイルエラー","Audio file error"),
-                                     self.tr("有効なWAVまたはMP3ファイルを選択してください。","Please choose a valid WAV or MP3 file."),parent=win)
-                return
-            self.cfg["timer_alert_volume"]=tav.get(); self.cfg["timer_alert_sound_file"]=path; save_config(self.cfg)
-        tk.Button(ta,text=self.tr("試聴","Preview"),command=preview_timer_alert,bg=c["button"],fg="white",
-                  relief="flat",font=self.ui(9),padx=10,pady=3,cursor="hand2").pack(side="left")
-        tk.Button(ta,text=self.tr("適用","Apply"),command=apply_timer_alert,bg=c["button"],fg="white",
-                  relief="flat",font=self.ui(9,"bold"),padx=10,pady=3,cursor="hand2").pack(side="right")
-
-        # Information page
-        inf=pages["info"]
-        info_card=tk.Frame(inf,bg=c["card"],highlightthickness=1,highlightbackground="#252c35")
-        info_card.pack(fill="x",pady=3)
-        tk.Label(info_card,text="AION2 Event Overlay",
-                 font=self.ui(12,"bold"),fg="white",bg=c["card"]).pack(anchor="w",padx=12,pady=(12,3))
-        tk.Label(info_card,text=f"Version {APP_VERSION}",
-                 font=self.ui(10),fg="#dcecff",bg=c["card"]).pack(anchor="w",padx=12,pady=(0,4))
-        # Keep the Japanese notice marker aligned with the first text line.
-        # A separate marker column also gives wrapped lines a clean hanging indent.
-        if self.cfg.get("language", "ja") == "ja":
-            tk.Label(info_card,
-                     text="AION2のイベント時刻・タイマー・アラートを表示するオーバーレイです。",
-                     font=self.ui(9),fg="#aeb9c7",bg=c["card"],justify="left",wraplength=340
-                     ).pack(anchor="w",padx=12,pady=(0,10))
-            notices=(
-                "ゲーム内部の時刻を直接参照していないため、ゲーム内の時刻と数秒程度の差が生じる場合があります。",
-                "本ツールは非公式のコミュニティツールであり、AION2およびNCSOFTの公式ツールではありません。",
-            )
-            for i, notice in enumerate(notices):
-                row=tk.Frame(info_card,bg=c["card"])
-                row.pack(fill="x",padx=12,pady=(0,10 if i == 0 else 12))
-                tk.Label(row,text="※",font=self.ui(9),fg="#aeb9c7",bg=c["card"],
-                         anchor="nw").pack(side="left",anchor="n")
-                tk.Label(row,text=notice,font=self.ui(9),fg="#aeb9c7",bg=c["card"],
-                         justify="left",wraplength=318,anchor="nw"
-                         ).pack(side="left",anchor="n",padx=(5,0))
-        else:
-            tk.Label(info_card,
-                     text=("An overlay for displaying AION2 event schedules, timers, and alerts.\n\n"
-                           "Note: This application does not access the game's internal clock, so displayed times may differ from the in-game time by a few seconds.\n\n"
-                           "This is an unofficial community tool and is not affiliated with or endorsed by AION2 or NCSOFT."),
-                     font=self.ui(9),fg="#aeb9c7",bg=c["card"],justify="left",wraplength=340
-                     ).pack(anchor="w",padx=12,pady=(0,12))
-
-        show_page("events")
-        def finish_settings_dialog():
-            try:
-                win.update_idletasks()
-                fit_settings()
-                win.deiconify()
-                win.lift()
-            except Exception:
-                pass
-        win.after_idle(finish_settings_dialog)
-        win.after_idle(fit_settings)
 
 
 
 
-    def edit_event(self,parent,index,refresh):
+
+    def edit_event_advanced(self,parent,index,refresh):
         old=self.cfg["events"][index] if index is not None else {
             "name_ja":"新規イベント","name_en":"New Event","type":"daily",
             "start":"12:00","entry_minutes":0,"notify_before_minutes":0,
@@ -1816,8 +1190,12 @@ class App(PingFeatureMixin):
         c=self.panel_colors()
         w=tk.Toplevel(parent); w.withdraw(); w.title(self.tr("イベント編集","Edit Event"))
         w.configure(bg=c["root"]); w.transient(parent); w.resizable(False,False)
+        self.window_group.register(w,parent)
 
-        outer=tk.Frame(w,bg=c["root"]); outer.pack(fill="both",expand=True,padx=9,pady=9)
+        from ping_feature import ScrollArea
+        editor_area=ScrollArea(w,height=520,bg=c['root']); editor_area.frame.pack(fill='both',expand=True,padx=9,pady=9)
+        outer=editor_area.body
+        w._position_key='event_editor' 
         head=tk.Frame(outer,bg=c["header"]); head.pack(fill="x")
         tk.Label(head,text=self.tr("イベント編集","EDIT EVENT"),font=self.ui(12,"bold"),
                  fg="white",bg=c["header"]).pack(anchor="w",padx=10,pady=8)
@@ -1827,51 +1205,63 @@ class App(PingFeatureMixin):
         ci=tk.Frame(common,bg=c["card"]); ci.pack(fill="x",padx=10,pady=8)
         def lab(p,s):
             tk.Label(p,text=s,fg="#f5f5f5",bg=c["card"],font=self.ui(9,"bold")).pack(anchor="w",pady=(5,2))
-        lab(ci,self.tr("日本語名","Japanese name"))
+        lab(ci,self.tr("日本語名（絵文字もここで編集）","Japanese name (including emoji)"))
         name_ja=tk.Entry(ci,bg=c["header"],fg="white",insertbackground="white",relief="flat")
         name_ja.insert(0,e.get("name_ja","")); name_ja.pack(fill="x")
         lab(ci,self.tr("英語名","English name"))
         name_en=tk.Entry(ci,bg=c["header"],fg="white",insertbackground="white",relief="flat")
-        name_en.insert(0,e.get("name_en","")); name_en.pack(fill="x")
+        name_en.insert(0,e.get("name_en_display",e.get("name_en",""))); name_en.pack(fill="x")
         lab(ci,self.tr("種類","Type"))
         typ=tk.StringVar(value=e.get("type","daily"))
-        typebox=ttk.Combobox(ci,textvariable=typ,state="readonly",values=["interval","daily","windows","weekly"])
+        typebox=ttk.Combobox(ci,textvariable=typ,state="readonly",values=["interval","daily","windows","weekly","once"])
         typebox.pack(fill="x")
         enabled=tk.BooleanVar(value=e.get("enabled",True))
         tk.Checkbutton(ci,text=self.tr("表示する","Enabled"),variable=enabled,bg=c["card"],fg="white",
                        selectcolor=c["header"],activebackground=c["card"],activeforeground="white").pack(anchor="w",pady=(8,2))
 
+        confirmed=tk.BooleanVar(value=e.get('schedule_confirmed',False))
+        tk.Checkbutton(ci,text='ゲーム内で確認した時刻を使用（未確認ならOFF）',variable=confirmed,
+                       bg=c['card'],fg='white',selectcolor=c['header'],activebackground=c['card'],
+                       activeforeground='white',wraplength=330).pack(anchor='w',pady=4)
+        tk.Label(ci,text=e.get('schedule_note','未確認'),bg=c['card'],fg='#8fa0b4',wraplength=330).pack(anchor='w')
         detail=tk.Frame(outer,bg=c["card"],highlightthickness=1,highlightbackground="#252c35")
         detail.pack(fill="x",pady=4)
         di=tk.Frame(detail,bg=c["card"]); di.pack(fill="x",padx=10,pady=8)
         widgets={}
 
+        from time_inputs import ClockPicker,DateTimePicker,MinutesPicker,WeekdayPicker,ClockList,protect_selectors
         def entry(key,title,value):
             lab(di,title)
-            x=tk.Entry(di,bg=c["header"],fg="white",insertbackground="white",relief="flat")
-            x.insert(0,str(value)); x.pack(fill="x"); widgets[key]=x
+            if key=='start':x=ClockPicker(di,self,value=str(value))
+            elif key=='at':x=DateTimePicker(di,self,value=str(value))
+            elif key=='weekdays_text':x=WeekdayPicker(di,self,value=str(value))
+            elif key in ('times_text','windows_text'):x=ClockList(di,self,value=str(value),windows=key=='windows_text')
+            else:x=MinutesPicker(di,self,value=str(value),seconds=key!='notify_before_minutes')
+            x.pack(fill='x',pady=4);widgets[key]=x
 
         def fit():
-            self._place_compact_dialog(w,390,300)
+            self._place_compact_dialog(w,480,590)
 
         def rebuild(*_):
             for x in di.winfo_children(): x.destroy()
             widgets.clear()
             t=typ.get()
             if t=="interval":
-                entry("start",self.tr("基準開始時刻 HH:MM","Base start HH:MM"),e.get("start","00:00"))
+                entry("start",self.tr("基準開始時刻","Base start HH:MM"),e.get("start","00:00"))
                 entry("interval_minutes",self.tr("開催間隔（分）","Interval (minutes)"),e.get("interval_minutes",60))
                 entry("entry_minutes",self.tr("入場カウントダウン（分）","Entry countdown (minutes)"),e.get("entry_minutes",0))
             elif t=="daily":
-                entry("start",self.tr("開始時刻 HH:MM","Start HH:MM"),e.get("start","12:00"))
+                entry("start",self.tr("開始時刻","Start HH:MM"),e.get("start","12:00"))
                 entry("entry_minutes",self.tr("入場カウントダウン（分）","Entry countdown (minutes)"),e.get("entry_minutes",0))
+            elif t=='once':
+                entry('at','今回の日付・時刻（日本時間）',e.get('at',''))
             elif t=="windows":
-                entry("windows_text",self.tr("開催時間帯（例 11:00-14:00,19:00-21:00）","Windows (11:00-14:00,19:00-21:00)"),
+                entry("windows_text",self.tr("開催時間帯（＋で追加）","Windows (11:00-14:00,19:00-21:00)"),
                       ",".join("-".join(x) for x in e.get("windows",[])))
             elif t=="weekly":
-                entry("weekdays_text",self.tr("曜日 0=月…6=日（例 2,5）","Weekdays 0=Mon…6=Sun"),
+                entry("weekdays_text",self.tr("開催する曜日","Weekdays 0=Mon…6=Sun"),
                       ",".join(map(str,e.get("weekdays",[]))))
-                entry("times_text",self.tr("開始時刻（例 21:20,21:50）","Start times (21:20,21:50)"),
+                entry("times_text",self.tr("開始時刻（＋で追加）","Start times (21:20,21:50)"),
                       ",".join(e.get("times",[])))
                 entry("entry_minutes",self.tr("入場カウントダウン（分）","Entry countdown (minutes)"),e.get("entry_minutes",0))
 
@@ -1898,6 +1288,13 @@ class App(PingFeatureMixin):
                 fg="#8fa0b4",bg=c["card"],font=self.ui(8),
                 justify="left",anchor="w",wraplength=340)
             timing_help.pack(fill="x",pady=(3,2))
+            if e.get('name_en') in ('Shugo Festa','Dimensional Invasion','Artifact Siege'):
+                before=widgets['notify_before_minutes']
+                before.delete(0,'end'); before.insert(0,'40' if e.get('name_en')=='Artifact Siege' else '0')
+                before.configure(state='readonly')
+                timing.set('both' if e.get('name_en')=='Artifact Siege' else 'start_only')
+                timing_box.configure(state='disabled')
+                timing_help.configure(text='40分前・30分前・開始時刻に通知（確認済み予定のみ）' if e.get('name_en')=='Artifact Siege' else '開始時刻のみ通知。事前通知はありません。')
             w.after_idle(fit)
 
         typebox.bind("<<ComboboxSelected>>",rebuild)
@@ -1909,11 +1306,22 @@ class App(PingFeatureMixin):
             if v<minimum: raise ValueError
             return v
 
+        def minuteval(k,minimum=0):
+            from schedule_edit_model import minutes
+            return minutes(widgets[k].get().strip(),minimum)
+
         def save():
             try:
-                ne={"name_ja":name_ja.get().strip() or "イベント",
-                    "name_en":name_en.get().strip() or "Event",
-                    "type":typ.get(),"enabled":enabled.get(),"alert_enabled":bool(old.get("alert_enabled",False))}
+                ne=dict(old)
+                ne.update({"name_ja":name_ja.get().strip() or "イベント",
+                    "name_en_display":name_en.get().strip() or "Event","emoji_in_name":True,
+                    "type":typ.get(),"enabled":enabled.get(),"alert_enabled":bool(old.get("alert_enabled",True))})
+                # Keep the built-in scheduling identity independent of display names.
+                ne.setdefault('name_en',name_en.get().strip() or 'Event')
+                import uuid
+                ne.setdefault('id','custom-'+uuid.uuid4().hex)
+                ne['schedule_confirmed']=confirmed.get()
+                ne['schedule_note']='ゲーム内確認済み（ユーザー登録）' if confirmed.get() else '未確認'
                 ne["notify_before_minutes"]=intval("notify_before_minutes",0)
                 ne["alert_timing"]=widgets["alert_timing_var"].get()
                 if ne["alert_timing"] not in ("both","start_only"):
@@ -1921,11 +1329,14 @@ class App(PingFeatureMixin):
                 t=typ.get()
                 if t=="interval":
                     ne["start"]=widgets["start"].get().strip(); parse_hm(ne["start"])
-                    ne["interval_minutes"]=intval("interval_minutes",1)
-                    ne["entry_minutes"]=intval("entry_minutes",0)
+                    ne["interval_minutes"]=minuteval("interval_minutes",.5)
+                    ne["entry_minutes"]=minuteval("entry_minutes",0)
                 elif t=="daily":
                     ne["start"]=widgets["start"].get().strip(); parse_hm(ne["start"])
-                    ne["entry_minutes"]=intval("entry_minutes",0)
+                    ne["entry_minutes"]=minuteval("entry_minutes",0)
+                elif t=='once':
+                    from schedule_edit_model import local_datetime
+                    ne['at']=local_datetime(widgets['at'].get()).isoformat()
                 elif t=="windows":
                     raw=widgets["windows_text"].get().strip()
                     if not raw: raise ValueError
@@ -1935,7 +1346,7 @@ class App(PingFeatureMixin):
                         if len(ab)!=2: raise ValueError
                         a,b=ab[0].strip(),ab[1].strip()
                         aa,bb=parse_hm(a),parse_hm(b)
-                        if bb<=aa: raise ValueError
+                        if bb==aa: raise ValueError
                         ne["windows"].append([a,b])
                 elif t=="weekly":
                     ne["weekdays"]=[int(x.strip()) for x in widgets["weekdays_text"].get().split(",") if x.strip()]
@@ -1943,7 +1354,13 @@ class App(PingFeatureMixin):
                     ne["times"]=[x.strip() for x in widgets["times_text"].get().split(",") if x.strip()]
                     if not ne["times"]: raise ValueError
                     for tm in ne["times"]: parse_hm(tm)
-                    ne["entry_minutes"]=intval("entry_minutes",0)
+                    ne["entry_minutes"]=minuteval("entry_minutes",0)
+                if t!='interval':ne.pop('interval_anchor',None)
+                elif old.get('interval_anchor') and ne['start']!=old.get('start'):
+                    from schedule_edit_model import local_datetime,JST
+                    anchor=local_datetime(old['interval_anchor'])
+                    ne['interval_anchor']=datetime.datetime.combine(anchor.date(),datetime.time.fromisoformat(ne['start']),JST).isoformat()
+                ne['schedule_edited']=True
             except Exception:
                 messagebox.showerror(self.tr("入力エラー","Input error"),
                     self.tr("イベント種類に必要な項目・時刻・数値を確認してください。",
@@ -1953,20 +1370,28 @@ class App(PingFeatureMixin):
             if index is None:self.cfg["events"].append(ne)
             else:self.cfg["events"][index]=ne
             save_config(self.cfg)
-            self.event_alert_state.clear()
+            self.event_previous=None
             self.rebuild_event_widgets()
             self.root.after_idle(self.fit_window_to_content)
             refresh()
-            w.destroy()
+            self._safe_dialog_close(w)
 
-        tk.Button(actions,text=self.tr("キャンセル","Cancel"),command=w.destroy,bg=c["button"],fg="white",relief="flat").pack(side="right",padx=(4,0))
+        tk.Button(actions,text=self.tr("キャンセル","Cancel"),command=lambda:self._safe_dialog_close(w),bg=c["button"],fg="white",relief="flat").pack(side="right",padx=(4,0))
         tk.Button(actions,text=self.tr("保存","Save"),command=save,bg=c["button"],fg="white",relief="flat",
                   font=self.ui(9,"bold")).pack(side="right")
         def reveal_editor():
+            def bind_wheel(widget):
+                editor_area.install_wheel(widget)
+                for child in widget.winfo_children(): bind_wheel(child)
+            bind_wheel(outer)
             fit()
+            outer._time_scroll_canvas=editor_area.canvas
+            protect_selectors(outer)
             w.deiconify()
             w.lift()
         w.after_idle(reveal_editor)
+        w._advanced_editor=dict(widgets=widgets,type=typ,typebox=typebox,rebuild=rebuild,save=save,name_ja=name_ja,win=w)
+        self._advanced_editor=w._advanced_editor
 
 
     def save_timers(self):
